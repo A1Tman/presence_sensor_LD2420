@@ -1,0 +1,14 @@
+# Set detected flash size to 4MB to match hardware and avoid warnings
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# Keep default simple partition table (factory app + nvs + phy)
+CONFIG_PARTITION_TABLE_SINGLE_APP=y
+CONFIG_PARTITION_TABLE_FILENAME="partitions_singleapp.csv"
+
+# Enable UART driver (already a default in IDF 5.x)
+CONFIG_UART_ISR_IN_IRAM=y
+
+# Console over USB-Serial-JTAG (free GPIO20/21 from UART0)
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_UART_NONE=y
