@@ -1018,24 +1018,20 @@ void ha_mqtt_publish_fw_version(const char *version) {
     pub(s_topic_fwver, v, 1, 1);
 }
 
-/* Diagnostic helpers (optional implementations) */
+/* Diagnostic hooks (no‑op by default) */
 void ha_mqtt_diag_publish_out(int raw, int active, int present) {
-    // Implementation would publish diagnostic data if needed
-    // Currently not implemented in original code
+    (void)raw; (void)active; (void)present;
 }
 
 void ha_mqtt_diag_publish_uart(int alive, int baud) {
-    // Implementation would publish UART diagnostic data if needed
-    // Currently not implemented in original code
+    (void)alive; (void)baud;
 }
 
-/* Direction events (LD2411) */
+/* Direction events (LD2411) – unused in this build */
 void ha_mqtt_publish_dir_approach(int on) {
-    // Implementation would publish approach direction events
-    // Currently not implemented in original code
+    (void)on;
 }
 
 void ha_mqtt_publish_dir_away(int on) {
-    // Implementation would publish away direction events
-    // Currently not implemented in original code
+    (void)on;
 }

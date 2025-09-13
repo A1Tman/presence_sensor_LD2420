@@ -59,7 +59,7 @@ static int64_t s_last_movement_time = 0;
 static int s_last_distance = -1;
 static ld2420_t* s_sensor = NULL;
 
-// LD2420 tuning (current values; TODO: apply to sensor when library supports it)
+// LD2420 tuning (current values)
 static int s_ld_min_gate = 0;        // 0..15
 static int s_ld_max_gate = 15;       // 0..15
 static int s_ld_delay_ms = 0;        // 0..65535
