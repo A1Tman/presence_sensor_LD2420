@@ -6,3 +6,5 @@ config/secrets.h
 tmp_app
 tmp_show
 main/old_versions
+.devcontainer/
+.vscode/
