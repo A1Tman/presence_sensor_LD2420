@@ -697,9 +697,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             char v[8]; snprintf(v, sizeof(v), "%d", s_smooth_win); 
             pub(s_topic_cfg_smooth_stat, v, 1, 1);
             
-            /* Re-send last presence state */
+        /* Re-send last presence state */
             if (s_have_last) {
                 ha_mqtt_publish_presence(s_last_present, s_last_distance_mm);
+            } else {
+                // Publish a baseline OFF state to avoid HA showing 'unknown'
+                ha_mqtt_publish_presence(false, -1);
             }
             break;
 
@@ -945,13 +948,15 @@ void ha_mqtt_stop(void) {
 }
 
 void ha_mqtt_publish_presence(bool present, int distance_mm) {
-    if (!s_connected) return;
-
+    // Always cache the latest state so we can re-publish after reconnect
     s_have_last = true;
     s_last_present = present;
     s_last_distance_mm = distance_mm;
 
-    pub(s_topic_presence, present ? "ON" : "OFF", 0, 0);
+    if (!s_connected) return;
+
+    // Retain presence so HA keeps state across restarts
+    pub(s_topic_presence, present ? "ON" : "OFF", 1, 1);
     pub(s_topic_status, "online", 1, 1);
 
     if (distance_mm >= 0 && s_cfg.distance_supported) {
@@ -975,7 +980,8 @@ void ha_mqtt_publish_presence(bool present, int distance_mm) {
         float cm = avg_mm / 10.0f;
         char buf[16];
         snprintf(buf, sizeof(buf), "%.1f", cm);
-        pub(s_topic_movement_distance, buf, 0, 0);
+        // Retain last distance value
+        pub(s_topic_movement_distance, buf, 1, 1);
 
         // Movement zones (only when movement detected)
         if (present) {
@@ -983,7 +989,8 @@ void ha_mqtt_publish_presence(bool present, int distance_mm) {
             for (int i = 0; i < 3; ++i) {
                 int on = (cur_cm >= s_zone_min_cm[i] && cur_cm <= s_zone_max_cm[i]) ? 1 : 0;
                 if (on != s_zone_last_on[i]) {
-                    pub(s_topic_zone_movement[i], on ? "ON" : "OFF", 0, 0);
+                    // Retain zone states so HA shows last known position on restart
+                    pub(s_topic_zone_movement[i], on ? "ON" : "OFF", 1, 1);
                     s_zone_last_on[i] = on;
                 }
             }
@@ -991,7 +998,7 @@ void ha_mqtt_publish_presence(bool present, int distance_mm) {
             // Clear all zones when no movement
             for (int i = 0; i < 3; ++i) {
                 if (s_zone_last_on[i]) {
-                    pub(s_topic_zone_movement[i], "OFF", 0, 0);
+                    pub(s_topic_zone_movement[i], "OFF", 1, 1);
                     s_zone_last_on[i] = 0;
                 }
             }
