@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -203,44 +204,106 @@ static void set_ld_maintain_sens(int v)  { xSemaphoreTake(s_state_mutex, portMAX
 
 static void apply_ld_config(void) {
     if (!s_sensor) return;
-    // Snapshot and validate under lock
+
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     int min_gate = s_ld_min_gate;
     int max_gate = s_ld_max_gate;
     int delay_ms = s_ld_delay_ms;
     int trig0    = s_ld_trigger_sens;
     int hold0    = s_ld_maintain_sens;
+
     if (min_gate < GATE_MIN) min_gate = GATE_MIN;
     if (min_gate > GATE_MAX) min_gate = GATE_MAX;
     if (max_gate < GATE_MIN) max_gate = GATE_MIN;
     if (max_gate > GATE_MAX) max_gate = GATE_MAX;
-    if (min_gate > max_gate) max_gate = min_gate; // ensure min <= max
+    if (min_gate > max_gate) max_gate = min_gate;
     if (delay_ms < DELAY_MIN_MS) delay_ms = DELAY_MIN_MS;
     if (delay_ms > DELAY_MAX_MS) delay_ms = DELAY_MAX_MS;
-    s_ld_min_gate = min_gate; s_ld_max_gate = max_gate; s_ld_delay_ms = delay_ms;
-    s_ld_trigger_sens = (trig0 < 0) ? 0 : (trig0 > 65535 ? 65535 : trig0);
-    s_ld_maintain_sens = (hold0 < 0) ? 0 : (hold0 > 65535 ? 65535 : hold0);
-    xSemaphoreGive(s_state_mutex);
 
     int trig0_local = (trig0 < 0) ? 0 : (trig0 > 65535 ? 65535 : trig0);
     int hold0_local = (hold0 < 0) ? 0 : (hold0 > 65535 ? 65535 : hold0);
+
+    s_ld_min_gate = min_gate;
+    s_ld_max_gate = max_gate;
+    s_ld_delay_ms = delay_ms;
+    s_ld_trigger_sens = trig0_local;
+    s_ld_maintain_sens = hold0_local;
+    xSemaphoreGive(s_state_mutex);
+
     ESP_LOGI(TAG, "Applying LD2420 config: min_gate=%d max_gate=%d delay_ms=%d trig0=%d maintain0=%d",
              min_gate, max_gate, delay_ms, trig0_local, hold0_local);
 
-    // Enter command mode and apply parameters
-    if (ld2420_enter_command_mode(s_sensor) != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to enter command mode");
+    if (!ld2420_lock(s_sensor, pdMS_TO_TICKS(500))) {
+        ESP_LOGW(TAG, "Unable to acquire LD2420 bus for config apply");
         return;
     }
-    // Apply gate range
-    ld2420_set_gate_range(s_sensor, min_gate, max_gate);
-    // Apply delay (ms)
-    ld2420_set_delay_ms(s_sensor, delay_ms);
-    // Apply trigger/maintain sensitivity for index 0 (00)
-    ld2420_set_trigger_sens(s_sensor, 0, (uint32_t)trig0_local);
-    ld2420_set_maintain_sens(s_sensor, 0, (uint32_t)hold0_local);
-    // Exit command mode
-    ld2420_exit_command_mode(s_sensor);
+
+    esp_err_t err = ld2420_enter_command_mode(s_sensor);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to enter command mode (%s)", esp_err_to_name(err));
+        ld2420_unlock(s_sensor);
+        return;
+    }
+
+    bool write_ok = true;
+    if (ld2420_set_gate_range(s_sensor, min_gate, max_gate) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set gate range");
+        write_ok = false;
+    }
+    if (ld2420_set_delay_ms(s_sensor, delay_ms) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set delay");
+        write_ok = false;
+    }
+    if (ld2420_set_trigger_sens(s_sensor, 0, (uint32_t)trig0_local) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set trigger sensitivity");
+        write_ok = false;
+    }
+    if (ld2420_set_maintain_sens(s_sensor, 0, (uint32_t)hold0_local) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set maintain sensitivity");
+        write_ok = false;
+    }
+
+    esp_err_t exit_err = ld2420_exit_command_mode(s_sensor);
+    if (exit_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to exit command mode (%s)", esp_err_to_name(exit_err));
+        write_ok = false;
+    }
+
+    ld2420_config_snapshot_t applied = {0};
+    esp_err_t read_err = ld2420_read_config(s_sensor, &applied);
+    ld2420_unlock(s_sensor);
+
+    if (read_err != ESP_OK) {
+        ESP_LOGW(TAG, "Unable to read back LD2420 config (%s)", esp_err_to_name(read_err));
+        return;
+    }
+
+    ESP_LOGI(TAG, "LD2420 reported config: min_gate=%d max_gate=%d delay_ms=%d trig0=%" PRIu32 " maintain0=%" PRIu32,
+             applied.min_gate, applied.max_gate, applied.delay_ms,
+             applied.trigger_sensitivity, applied.maintain_sensitivity);
+
+    bool mismatch = (applied.min_gate != min_gate) ||
+                    (applied.max_gate != max_gate) ||
+                    (applied.delay_ms != delay_ms) ||
+                    ((int)applied.trigger_sensitivity != trig0_local) ||
+                    ((int)applied.maintain_sensitivity != hold0_local);
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_ld_min_gate = applied.min_gate;
+    s_ld_max_gate = applied.max_gate;
+    s_ld_delay_ms = applied.delay_ms;
+    s_ld_trigger_sens = (applied.trigger_sensitivity > 65535U) ? 65535 : (int)applied.trigger_sensitivity;
+    s_ld_maintain_sens = (applied.maintain_sensitivity > 65535U) ? 65535 : (int)applied.maintain_sensitivity;
+    xSemaphoreGive(s_state_mutex);
+
+    if (!write_ok) {
+        ESP_LOGW(TAG, "One or more LD2420 config writes reported errors");
+    }
+    if (mismatch) {
+        ESP_LOGW(TAG, "LD2420 applied values differ from requested");
+    } else if (write_ok) {
+        ESP_LOGI(TAG, "LD2420 configuration verified");
+    }
 }
 
 // ==================== MQTT SETUP ====================
@@ -290,11 +353,11 @@ static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_retry_num < 5) {
-            esp_wifi_connect();
-            s_retry_num++;
-            ESP_LOGW(TAG, "WiFi retry %d/5", s_retry_num);
-        } else {
+        esp_wifi_connect();
+        s_retry_num++;
+        ESP_LOGW(TAG, "WiFi disconnected, retry #%d", s_retry_num);
+        if (s_retry_num == 5) {
+            // Allow the main task to continue after initial failures while retries persist in background
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {

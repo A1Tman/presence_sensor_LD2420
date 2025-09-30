@@ -4,6 +4,8 @@
 #include "esp_err.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -38,6 +40,7 @@ typedef void (*ld2420_data_cb)(ld2420_data_t data);
 struct ld2420_t {
     uart_port_t uart_port;
     ld2420_data_t current_data;
+    SemaphoreHandle_t uart_lock;
     
     // Callbacks
     ld2420_detection_cb on_detection;
@@ -59,6 +62,14 @@ struct ld2420_t {
     bool config_mode;
 };
 
+typedef struct {
+    int min_gate;
+    int max_gate;
+    int delay_ms;
+    uint32_t trigger_sensitivity;
+    uint32_t maintain_sensitivity;
+} ld2420_config_snapshot_t;
+
 // Public functions
 ld2420_t* ld2420_create(void);
 esp_err_t ld2420_begin(ld2420_t* sensor, uart_port_t uart_port, gpio_num_t tx_pin, gpio_num_t rx_pin, int baud_rate);
@@ -68,6 +79,9 @@ void ld2420_update(ld2420_t* sensor);
 bool ld2420_is_detecting(ld2420_t* sensor);
 ld2420_data_t ld2420_get_current_data(ld2420_t* sensor);
 bool ld2420_check_ot2(gpio_num_t ot2_pin);
+
+bool ld2420_lock(ld2420_t* sensor, TickType_t timeout_ticks);
+void ld2420_unlock(ld2420_t* sensor);
 
 // Callback registration
 void ld2420_on_detection(ld2420_t* sensor, ld2420_detection_cb callback);
@@ -90,5 +104,6 @@ esp_err_t ld2420_set_gate_range(ld2420_t* sensor, int min_gate, int max_gate);
 esp_err_t ld2420_set_delay_ms(ld2420_t* sensor, int delay_ms);
 esp_err_t ld2420_set_trigger_sens(ld2420_t* sensor, int index, uint32_t value);   // index 0..15 maps to 0x0010+index
 esp_err_t ld2420_set_maintain_sens(ld2420_t* sensor, int index, uint32_t value);  // index 0..15 maps to 0x0020+index
+esp_err_t ld2420_read_config(ld2420_t* sensor, ld2420_config_snapshot_t *out_config);
 
 #endif // LD2420_H

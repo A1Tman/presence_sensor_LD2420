@@ -14,6 +14,8 @@
 #include "mqtt_client.h"
 #include "sensor_info.h"
 #include <strings.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 /* ======================= Module state ======================= */
 static const char *TAG = "ha_mqtt";
@@ -31,6 +33,7 @@ static ha_mqtt_cfg_t s_cfg = {
 
 static esp_mqtt_client_handle_t s_client = NULL;
 static bool s_connected = false;
+static SemaphoreHandle_t s_publish_lock = NULL;
 
 /* Internal owned storage for dynamic strings */
 static char s_broker_uri[128];
@@ -102,6 +105,8 @@ static bool s_restart_migration_done = false;
 static bool s_have_last = false;
 static bool s_last_present = false;
 static int  s_last_distance_mm = -1;
+static bool s_have_fw_version = false;
+static char s_last_fw_version[64] = {0};
 
 /* Uptime ticker */
 static int64_t s_boot_us = 0;
@@ -698,11 +703,38 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             pub(s_topic_cfg_smooth_stat, v, 1, 1);
             
         /* Re-send last presence state */
-            if (s_have_last) {
-                ha_mqtt_publish_presence(s_last_present, s_last_distance_mm);
+            bool cached_have = s_have_last;
+            bool cached_present = s_last_present;
+            int cached_distance = s_last_distance_mm;
+            if (s_publish_lock && xSemaphoreTake(s_publish_lock, portMAX_DELAY) == pdTRUE) {
+                cached_have = s_have_last;
+                cached_present = s_last_present;
+                cached_distance = s_last_distance_mm;
+                xSemaphoreGive(s_publish_lock);
+            }
+            if (cached_have) {
+                ha_mqtt_publish_presence(cached_present, cached_distance);
             } else {
                 // Publish a baseline OFF state to avoid HA showing 'unknown'
                 ha_mqtt_publish_presence(false, -1);
+            }
+
+            char fw_buf[sizeof(s_last_fw_version)] = {0};
+            bool publish_fw = false;
+            if (s_publish_lock && xSemaphoreTake(s_publish_lock, portMAX_DELAY) == pdTRUE) {
+                if (s_have_fw_version) {
+                    strncpy(fw_buf, s_last_fw_version, sizeof(fw_buf) - 1);
+                    fw_buf[sizeof(fw_buf) - 1] = '\0';
+                    publish_fw = true;
+                }
+                xSemaphoreGive(s_publish_lock);
+            } else if (s_have_fw_version) {
+                strncpy(fw_buf, s_last_fw_version, sizeof(fw_buf) - 1);
+                fw_buf[sizeof(fw_buf) - 1] = '\0';
+                publish_fw = true;
+            }
+            if (publish_fw) {
+                ha_mqtt_publish_fw_version(fw_buf);
             }
             break;
 
@@ -880,6 +912,13 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 void ha_mqtt_init(const ha_mqtt_cfg_t *cfg) {
     if (cfg) s_cfg = *cfg;
 
+    if (s_publish_lock == NULL) {
+        s_publish_lock = xSemaphoreCreateMutex();
+        if (s_publish_lock == NULL) {
+            ESP_LOGE(TAG, "Failed to create publish mutex");
+        }
+    }
+
     if (cfg && cfg->broker_uri && cfg->broker_uri[0]) {
         // If a CA cert is provided but URI uses mqtt://, upgrade to mqtts://
         const char *src = cfg->broker_uri;
@@ -948,10 +987,73 @@ void ha_mqtt_stop(void) {
 }
 
 void ha_mqtt_publish_presence(bool present, int distance_mm) {
-    // Always cache the latest state so we can re-publish after reconnect
-    s_have_last = true;
-    s_last_present = present;
-    s_last_distance_mm = distance_mm;
+    bool publish_distance = false;
+    int avg_mm_snapshot = -1;
+    int zone_updates[3] = { -1, -1, -1 };
+
+    bool lock_taken = false;
+    if (s_publish_lock) {
+        lock_taken = xSemaphoreTake(s_publish_lock, portMAX_DELAY) == pdTRUE;
+    }
+
+    if (!s_publish_lock || lock_taken) {
+        // Cache last known state for reconnect scenarios
+        s_have_last = true;
+        s_last_present = present;
+        s_last_distance_mm = distance_mm;
+
+        if (distance_mm >= 0 && s_cfg.distance_supported) {
+            if (s_smooth_win < 1) s_smooth_win = 1;
+            if (s_smooth_win > 10) s_smooth_win = 10;
+
+            s_smooth_ring[s_smooth_head] = distance_mm;
+            s_smooth_head = (s_smooth_head + 1) % SMOOTH_BUFFER_SIZE;
+            if (s_smooth_count < s_smooth_win) s_smooth_count++;
+
+            int count = (s_smooth_count < s_smooth_win) ? s_smooth_count : s_smooth_win;
+            int sum = 0;
+            for (int i = 0; i < count; i++) {
+                int idx = (s_smooth_head - 1 - i + SMOOTH_BUFFER_SIZE) % SMOOTH_BUFFER_SIZE;
+                sum += s_smooth_ring[idx];
+            }
+            avg_mm_snapshot = (count ? sum / count : distance_mm);
+            publish_distance = true;
+
+            if (present) {
+                int cur_cm = (avg_mm_snapshot + 5) / 10;
+                for (int i = 0; i < 3; ++i) {
+                    int on = (cur_cm >= s_zone_min_cm[i] && cur_cm <= s_zone_max_cm[i]) ? 1 : 0;
+                    if (on != s_zone_last_on[i]) {
+                        s_zone_last_on[i] = on;
+                        zone_updates[i] = on;
+                    }
+                }
+            } else {
+                for (int i = 0; i < 3; ++i) {
+                    if (s_zone_last_on[i]) {
+                        s_zone_last_on[i] = 0;
+                        zone_updates[i] = 0;
+                    }
+                }
+            }
+        } else if (!present) {
+            for (int i = 0; i < 3; ++i) {
+                if (s_zone_last_on[i]) {
+                    s_zone_last_on[i] = 0;
+                    zone_updates[i] = 0;
+                }
+            }
+        }
+
+        if (lock_taken) {
+            xSemaphoreGive(s_publish_lock);
+        }
+    } else {
+        // Mutex unavailable: still keep cached state coherent
+        s_have_last = true;
+        s_last_present = present;
+        s_last_distance_mm = distance_mm;
+    }
 
     if (!s_connected) return;
 
@@ -959,49 +1061,16 @@ void ha_mqtt_publish_presence(bool present, int distance_mm) {
     pub(s_topic_presence, present ? "ON" : "OFF", 1, 1);
     pub(s_topic_status, "online", 1, 1);
 
-    if (distance_mm >= 0 && s_cfg.distance_supported) {
-        // Distance smoothing with fixed buffer
-        if (s_smooth_win < 1) s_smooth_win = 1;
-        if (s_smooth_win > 10) s_smooth_win = 10;
-        
-        s_smooth_ring[s_smooth_head] = distance_mm;
-        s_smooth_head = (s_smooth_head + 1) % SMOOTH_BUFFER_SIZE;
-        if (s_smooth_count < s_smooth_win) s_smooth_count++;
-        
-        // Calculate average over actual window size
-        int sum = 0;
-        int count = (s_smooth_count < s_smooth_win) ? s_smooth_count : s_smooth_win;
-        for (int i = 0; i < count; i++) {
-            int idx = (s_smooth_head - 1 - i + SMOOTH_BUFFER_SIZE) % SMOOTH_BUFFER_SIZE;
-            sum += s_smooth_ring[idx];
-        }
-        int avg_mm = sum / (count ? count : 1);
-        
-        float cm = avg_mm / 10.0f;
+    if (publish_distance && avg_mm_snapshot >= 0) {
         char buf[16];
+        float cm = avg_mm_snapshot / 10.0f;
         snprintf(buf, sizeof(buf), "%.1f", cm);
-        // Retain last distance value
         pub(s_topic_movement_distance, buf, 1, 1);
+    }
 
-        // Movement zones (only when movement detected)
-        if (present) {
-            int cur_cm = (avg_mm + 5) / 10; // round mm to cm
-            for (int i = 0; i < 3; ++i) {
-                int on = (cur_cm >= s_zone_min_cm[i] && cur_cm <= s_zone_max_cm[i]) ? 1 : 0;
-                if (on != s_zone_last_on[i]) {
-                    // Retain zone states so HA shows last known position on restart
-                    pub(s_topic_zone_movement[i], on ? "ON" : "OFF", 1, 1);
-                    s_zone_last_on[i] = on;
-                }
-            }
-        } else {
-            // Clear all zones when no movement
-            for (int i = 0; i < 3; ++i) {
-                if (s_zone_last_on[i]) {
-                    pub(s_topic_zone_movement[i], "OFF", 1, 1);
-                    s_zone_last_on[i] = 0;
-                }
-            }
+    for (int i = 0; i < 3; ++i) {
+        if (zone_updates[i] != -1) {
+            pub(s_topic_zone_movement[i], zone_updates[i] ? "ON" : "OFF", 1, 1);
         }
     }
 
@@ -1020,9 +1089,33 @@ void ha_mqtt_resend_discovery(void) {
 }
 
 void ha_mqtt_publish_fw_version(const char *version) {
+    const char *incoming = (version && version[0]) ? version : "unknown";
+    bool lock_taken = false;
+    if (s_publish_lock) {
+        lock_taken = xSemaphoreTake(s_publish_lock, portMAX_DELAY) == pdTRUE;
+    }
+
+    if (!s_publish_lock || lock_taken) {
+        size_t len = strlen(incoming);
+        if (len >= sizeof(s_last_fw_version)) len = sizeof(s_last_fw_version) - 1;
+        memcpy(s_last_fw_version, incoming, len);
+        s_last_fw_version[len] = '\0';
+        s_have_fw_version = true;
+        if (lock_taken) {
+            xSemaphoreGive(s_publish_lock);
+        }
+    } else {
+        size_t len = strlen(incoming);
+        if (len >= sizeof(s_last_fw_version)) len = sizeof(s_last_fw_version) - 1;
+        memcpy(s_last_fw_version, incoming, len);
+        s_last_fw_version[len] = '\0';
+        s_have_fw_version = true;
+    }
+
     if (!s_connected) return;
-    const char *v = (version && version[0]) ? version : "unknown";
-    pub(s_topic_fwver, v, 1, 1);
+
+    const char *to_send = (s_have_fw_version && s_last_fw_version[0]) ? s_last_fw_version : incoming;
+    pub(s_topic_fwver, to_send, 1, 1);
 }
 
 /* Diagnostic hooks (no‑op by default) */
