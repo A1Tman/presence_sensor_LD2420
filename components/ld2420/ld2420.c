@@ -887,6 +887,9 @@ static void parse_byte(ld2420_t* sensor, uint8_t byte) {
                 ESP_LOGW(TAG, "Invalid footer at position %d", sensor->tail_index);
                 sensor->parse_state = 0;
                 sensor->header_index = 0;
+                sensor->data_index = 0;
+                sensor->tail_index = 0;
+                sensor->packet_length = 0;
             }
             break;
     }

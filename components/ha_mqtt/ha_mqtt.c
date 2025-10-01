@@ -1095,21 +1095,24 @@ void ha_mqtt_publish_fw_version(const char *version) {
         lock_taken = xSemaphoreTake(s_publish_lock, portMAX_DELAY) == pdTRUE;
     }
 
-    if (!s_publish_lock || lock_taken) {
+    if (!s_publish_lock) {
         size_t len = strlen(incoming);
         if (len >= sizeof(s_last_fw_version)) len = sizeof(s_last_fw_version) - 1;
         memcpy(s_last_fw_version, incoming, len);
         s_last_fw_version[len] = '\0';
         s_have_fw_version = true;
-        if (lock_taken) {
-            xSemaphoreGive(s_publish_lock);
-        }
     } else {
-        size_t len = strlen(incoming);
-        if (len >= sizeof(s_last_fw_version)) len = sizeof(s_last_fw_version) - 1;
-        memcpy(s_last_fw_version, incoming, len);
-        s_last_fw_version[len] = '\0';
-        s_have_fw_version = true;
+        if (lock_taken) {
+            size_t len = strlen(incoming);
+            if (len >= sizeof(s_last_fw_version)) len = sizeof(s_last_fw_version) - 1;
+            memcpy(s_last_fw_version, incoming, len);
+            s_last_fw_version[len] = '\0';
+            s_have_fw_version = true;
+            xSemaphoreGive(s_publish_lock);
+        } else {
+            ESP_LOGW(TAG, "publish_fw_version: publish mutex unavailable");
+            return;
+        }
     }
 
     if (!s_connected) return;
