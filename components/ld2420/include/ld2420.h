@@ -40,8 +40,8 @@ typedef void (*ld2420_data_cb)(ld2420_data_t data);
 struct ld2420_t {
     uart_port_t uart_port;
     ld2420_data_t current_data;
-    SemaphoreHandle_t uart_lock;
-    
+    SemaphoreHandle_t uart_lock;  // Recursive mutex - allows nested locking by same task
+
     // Callbacks
     ld2420_detection_cb on_detection;
     ld2420_state_change_cb on_state_change;
@@ -72,6 +72,7 @@ typedef struct {
 
 // Public functions
 ld2420_t* ld2420_create(void);
+void ld2420_destroy(ld2420_t* sensor);
 esp_err_t ld2420_begin(ld2420_t* sensor, uart_port_t uart_port, gpio_num_t tx_pin, gpio_num_t rx_pin, int baud_rate);
 esp_err_t ld2420_begin_with_ot2(ld2420_t* sensor, uart_port_t uart_port, gpio_num_t tx_pin, 
                                   gpio_num_t rx_pin, gpio_num_t ot2_pin, int baud_rate);

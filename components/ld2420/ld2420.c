@@ -86,7 +86,7 @@ const uint8_t DATA_FOOTER[] = {0xF8, 0xF7, 0xF6, 0xF5};
 static void log_buffer_hex(const char* tag, const uint8_t* buffer, size_t len) {
     char hex_str[len * 3 + 1];
     for (size_t i = 0; i < len; i++) {
-        sprintf(hex_str + i * 3, "%02X ", buffer[i]);
+        snprintf(hex_str + i * 3, 4, "%02X ", buffer[i]);
     }
     ESP_LOGD(tag, "%s", hex_str);
 }
@@ -653,6 +653,24 @@ ld2420_t* ld2420_create(void) {
     sensor->data_index = 0;
     sensor->tail_index = 0;
     return sensor;
+}
+
+void ld2420_destroy(ld2420_t* sensor) {
+    if (sensor == NULL) {
+        return;
+    }
+
+    // Delete the mutex if it exists
+    if (sensor->uart_lock != NULL) {
+        vSemaphoreDelete(sensor->uart_lock);
+        sensor->uart_lock = NULL;
+    }
+
+    // Note: We don't delete the UART driver here because it may be shared
+    // or managed externally. The caller should handle UART cleanup if needed.
+
+    // Free the sensor structure
+    free(sensor);
 }
 
 // Initialize sensor
