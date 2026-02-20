@@ -78,6 +78,14 @@ void ha_mqtt_init(const ha_mqtt_cfg_t *cfg);
 /** Start MQTT client. Call after Wi-Fi is up (e.g. on IP_EVENT_STA_GOT_IP). */
 void ha_mqtt_start(void);
 
+/**
+ * If the MQTT client exists but is not currently connected, trigger an
+ * immediate reconnect attempt. Call this on every IP_EVENT_STA_GOT_IP after
+ * the first boot so that a stalled auto-reconnect is kicked immediately when
+ * Wi-Fi comes back, rather than waiting for the next backoff timeout.
+ */
+void ha_mqtt_reconnect_if_disconnected(void);
+
 /** Stop MQTT client (optional). */
 void ha_mqtt_stop(void);
 

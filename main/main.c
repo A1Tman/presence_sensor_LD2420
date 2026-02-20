@@ -308,6 +308,15 @@ static void apply_ld_config(void) {
 
 // ==================== MQTT SETUP ====================
 static void start_mqtt(void) {
+    // Guard: only initialise once. On subsequent WiFi reconnects the MQTT
+    // client handles reconnection internally; we just kick it explicitly in
+    // case its backoff timer has stalled.
+    static bool s_mqtt_initialized = false;
+    if (s_mqtt_initialized) {
+        ha_mqtt_reconnect_if_disconnected();
+        return;
+    }
+
     char uri[96];
 #ifdef MQTT_BROKER_CA_CERT_PEM
     const char *ca_pem = MQTT_BROKER_CA_CERT_PEM;
@@ -343,9 +352,10 @@ static void start_mqtt(void) {
         .set_ld_maintain_sens = set_ld_maintain_sens,
         .action_apply_config = apply_ld_config,
     };
-    
+
     ha_mqtt_init(&cfg);
     ha_mqtt_start();
+    s_mqtt_initialized = true;
 }
 
 // ==================== WIFI ====================

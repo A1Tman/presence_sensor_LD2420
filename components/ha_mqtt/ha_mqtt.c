@@ -986,6 +986,13 @@ void ha_mqtt_stop(void) {
     s_connected = false;
 }
 
+void ha_mqtt_reconnect_if_disconnected(void) {
+    if (s_client && !s_connected) {
+        ESP_LOGI(TAG, "Wi-Fi up, MQTT not connected - triggering immediate reconnect");
+        esp_mqtt_client_reconnect(s_client);
+    }
+}
+
 void ha_mqtt_publish_presence(bool present, int distance_mm) {
     bool publish_distance = false;
     int avg_mm_snapshot = -1;
