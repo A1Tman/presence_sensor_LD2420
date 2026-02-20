@@ -17,7 +17,7 @@
 #include "ha_mqtt.h"
 #include "../config/secrets.h"
 
-#define DEVICE_VERSION "1.1.0"
+#define DEVICE_VERSION "1.2.0"
 
 // ==================== CONSTANTS ====================
 #define DIST_MIN_VALID_CM          10

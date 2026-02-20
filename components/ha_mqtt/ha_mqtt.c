@@ -26,7 +26,7 @@ static ha_mqtt_cfg_t s_cfg = {
     .password      = NULL,
     .friendly_name = "Radar Sensor",
     .suggested_area= NULL,
-    .app_version   = "1.1.1",
+    .app_version   = "1.2.0",
     .distance_supported = true,
     .broker_ca_cert_pem = NULL,
 };
