@@ -89,6 +89,9 @@ void ha_mqtt_reconnect_if_disconnected(void);
 /** Stop MQTT client (optional). */
 void ha_mqtt_stop(void);
 
+/** True if the MQTT client is currently connected. */
+bool ha_mqtt_is_connected(void);
+
 /** Publish presence + optional distance (mm). distance_mm < 0 if unknown. */
 void ha_mqtt_publish_presence(bool present, int distance_mm);
 

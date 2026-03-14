@@ -12,7 +12,8 @@ ESP32‑C3 OLED dev board pin map used here:
 - 3.3 V power and common GND between ESP32‑C3 and LD2420
 
 Notes
-- The board’s OLED (SCL=GPIO6, SDA=GPIO5) isn’t used by this firmware.
+- The board’s OLED (SCL=GPIO6, SDA=GPIO5) shows a local status view:
+  boot screen, live presence/network page, LD2420 config page, and fault overrides.
 - Use a clean 3.3 V supply and common ground.
 
 ## Build
@@ -34,6 +35,12 @@ This firmware publishes HA discovery. After boot you’ll see a device with:
 - `number` (config): Movement Threshold (cm), Presence Hold (s)
 - `number` (LD2420): Min/Max Gate, Response Delay (ms), Trigger Level, Tracking Level
 - `button`: Apply Config (config), Restart (diagnostic), Resend Discovery (diagnostic)
+
+The onboard 72x40 OLED mirrors key local state without needing Home Assistant:
+
+- Page 1: presence, distance, Wi‑Fi RSSI, MQTT state, IP suffix
+- Page 2: LD2420 min/max gate, delay, trigger, tracking, firmware
+- Fault override: radar init/no-data, Wi‑Fi down, or MQTT waiting
 
 Buttons only act on press and are rate‑limited. “Apply Config” writes your staged LD2420 values over UART in command mode.
 

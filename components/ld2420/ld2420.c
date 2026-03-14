@@ -54,14 +54,6 @@ void ld2420_unlock(ld2420_t* sensor)
     uart_lock_give(sensor);
 }
 
-static uint32_t byteswap32(uint32_t v)
-{
-    return ((v & 0x000000FFu) << 24) |
-           ((v & 0x0000FF00u) << 8)  |
-           ((v & 0x00FF0000u) >> 8)  |
-           ((v & 0xFF000000u) >> 24);
-}
-
 // Command packet format (from ESPHome)
 const uint8_t CMD_HEADER[] = {0xFD, 0xFC, 0xFB, 0xFA};
 const uint8_t CMD_FOOTER[] = {0x04, 0x03, 0x02, 0x01};
@@ -459,7 +451,7 @@ static esp_err_t ld2420_read_config_locked_internal(ld2420_t* sensor, ld2420_con
     for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
         uint32_t raw = 0;
         memcpy(&raw, &rx[offset + (i * 4)], sizeof(raw));
-        values[i] = byteswap32(raw);
+        values[i] = raw;
     }
 
     out_config->min_gate = (int)values[0];

@@ -74,18 +74,20 @@ static char s_topic_cmd_apply_cfg[96];
 
 /* Distance smoothing + movement zones */
 #define SMOOTH_BUFFER_SIZE 16
+#define ZONE_COUNT 3
+#define ZONE_DISTANCE_MAX_CM 600
 static int  s_smooth_win = 5;
 static int  s_smooth_ring[SMOOTH_BUFFER_SIZE];
 static int  s_smooth_count = 0;
 static int  s_smooth_head = 0;
-static int  s_zone_min_cm[3] = {0, 100, 200};  // Near, Mid, Far
-static int  s_zone_max_cm[3] = {99, 199, 400};
-static int  s_zone_last_on[3] = {0, 0, 0};
-static char s_topic_zone_movement[3][96];
-static char s_topic_cfg_zone_min_stat[3][96];
-static char s_topic_cfg_zone_min_cmd[3][96];
-static char s_topic_cfg_zone_max_stat[3][96];
-static char s_topic_cfg_zone_max_cmd[3][96];
+static int  s_zone_min_cm[ZONE_COUNT] = {0, 100, 200};  // Near, Mid, Far
+static int  s_zone_max_cm[ZONE_COUNT] = {99, 199, 400};
+static int  s_zone_last_on[ZONE_COUNT] = {0, 0, 0};
+static char s_topic_zone_movement[ZONE_COUNT][96];
+static char s_topic_cfg_zone_min_stat[ZONE_COUNT][96];
+static char s_topic_cfg_zone_min_cmd[ZONE_COUNT][96];
+static char s_topic_cfg_zone_max_stat[ZONE_COUNT][96];
+static char s_topic_cfg_zone_max_cmd[ZONE_COUNT][96];
 static char s_topic_cfg_smooth_stat[96];
 static char s_topic_cfg_smooth_cmd[96];
 
@@ -118,6 +120,8 @@ static int64_t s_last_apply_us = 0;
 #define APPLY_MIN_INTERVAL_US   (5LL  * 1000000LL)
 
 /* ======================= Utilities ======================= */
+static void pub(const char *topic, const char *payload, int qos, int retain);
+
 static void mac_to_str(uint8_t mac[6], char out[18]) {
     snprintf(out, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
@@ -149,6 +153,111 @@ static bool safe_atoi(const char *str, int len, int *out_val, int min, int max) 
     
     *out_val = (int)val;
     return true;
+}
+
+static void clamp_zone_value(int *value) {
+    if (!value) return;
+    if (*value < 0) *value = 0;
+    if (*value > ZONE_DISTANCE_MAX_CM) *value = ZONE_DISTANCE_MAX_CM;
+}
+
+static void normalize_zone_ranges_locked(void) {
+    for (int i = 0; i < ZONE_COUNT; ++i) {
+        clamp_zone_value(&s_zone_min_cm[i]);
+        clamp_zone_value(&s_zone_max_cm[i]);
+        if (s_zone_min_cm[i] > s_zone_max_cm[i]) {
+            s_zone_max_cm[i] = s_zone_min_cm[i];
+        }
+    }
+
+    for (int i = 1; i < ZONE_COUNT; ++i) {
+        if (s_zone_min_cm[i] <= s_zone_max_cm[i - 1]) {
+            s_zone_min_cm[i] = s_zone_max_cm[i - 1] + 1;
+            clamp_zone_value(&s_zone_min_cm[i]);
+            if (s_zone_max_cm[i] < s_zone_min_cm[i]) {
+                s_zone_max_cm[i] = s_zone_min_cm[i];
+            }
+        }
+        clamp_zone_value(&s_zone_max_cm[i]);
+    }
+
+    for (int i = ZONE_COUNT - 2; i >= 0; --i) {
+        if (s_zone_max_cm[i] >= s_zone_min_cm[i + 1]) {
+            s_zone_max_cm[i] = s_zone_min_cm[i + 1] - 1;
+            clamp_zone_value(&s_zone_max_cm[i]);
+            if (s_zone_max_cm[i] < s_zone_min_cm[i]) {
+                s_zone_min_cm[i] = s_zone_max_cm[i];
+            }
+        }
+        clamp_zone_value(&s_zone_min_cm[i]);
+    }
+
+    for (int i = 1; i < ZONE_COUNT; ++i) {
+        if (s_zone_min_cm[i] <= s_zone_max_cm[i - 1]) {
+            s_zone_min_cm[i] = s_zone_max_cm[i - 1] + 1;
+            clamp_zone_value(&s_zone_min_cm[i]);
+            if (s_zone_max_cm[i] < s_zone_min_cm[i]) {
+                s_zone_max_cm[i] = s_zone_min_cm[i];
+            }
+        }
+        clamp_zone_value(&s_zone_max_cm[i]);
+    }
+}
+
+static void snapshot_zone_ranges(int mins[ZONE_COUNT], int maxs[ZONE_COUNT]) {
+    bool lock_taken = false;
+    if (s_publish_lock) {
+        lock_taken = xSemaphoreTake(s_publish_lock, portMAX_DELAY) == pdTRUE;
+    }
+
+    for (int i = 0; i < ZONE_COUNT; ++i) {
+        mins[i] = s_zone_min_cm[i];
+        maxs[i] = s_zone_max_cm[i];
+    }
+
+    if (lock_taken) {
+        xSemaphoreGive(s_publish_lock);
+    }
+}
+
+static void publish_zone_config_states(void) {
+    int mins[ZONE_COUNT];
+    int maxs[ZONE_COUNT];
+    snapshot_zone_ranges(mins, maxs);
+
+    for (int i = 0; i < ZONE_COUNT; ++i) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%d", mins[i]);
+        pub(s_topic_cfg_zone_min_stat[i], buf, 1, 1);
+        snprintf(buf, sizeof(buf), "%d", maxs[i]);
+        pub(s_topic_cfg_zone_max_stat[i], buf, 1, 1);
+    }
+}
+
+static void set_zone_boundary(int index, bool set_min, int value) {
+    bool lock_taken = false;
+    if (s_publish_lock) {
+        lock_taken = xSemaphoreTake(s_publish_lock, portMAX_DELAY) == pdTRUE;
+    }
+
+    if (!s_publish_lock || lock_taken) {
+        if (set_min) {
+            s_zone_min_cm[index] = value;
+        } else {
+            s_zone_max_cm[index] = value;
+        }
+        normalize_zone_ranges_locked();
+
+        int normalized_min = s_zone_min_cm[index];
+        int normalized_max = s_zone_max_cm[index];
+
+        if (lock_taken) {
+            xSemaphoreGive(s_publish_lock);
+        }
+
+        publish_zone_config_states();
+        ESP_LOGI(TAG, "Set zone %d range: %d-%d cm", index, normalized_min, normalized_max);
+    }
 }
 
 static void derive_ids_and_topics(void) {
@@ -192,7 +301,7 @@ static void derive_ids_and_topics(void) {
 
     /* Movement zones */
     const char* zone_names[] = {"near", "mid", "far"};
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < ZONE_COUNT; ++i) {
         snprintf(s_topic_zone_movement[i], sizeof(s_topic_zone_movement[i]), "%s/movement/%s_range", s_topic_base, zone_names[i]);
         snprintf(s_topic_cfg_zone_min_stat[i], sizeof(s_topic_cfg_zone_min_stat[i]), "%s/cfg/zone/%s/min_cm", s_topic_base, zone_names[i]);
         snprintf(s_topic_cfg_zone_min_cmd[i], sizeof(s_topic_cfg_zone_min_cmd[i]), "%s/cmd/zone/%s/min_cm", s_topic_base, zone_names[i]);
@@ -452,7 +561,7 @@ static void publish_discovery_all(void) {
 
     /* Movement zone binary_sensors */
     const char* zone_names[] = {"Near Zone", "Mid Zone", "Far Zone"};
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < ZONE_COUNT; ++i) {
         char payload[1024]; int len=0;
         len += snprintf(payload+len, sizeof(payload)-len,
             "{\"name\":\"%s\",\"uniq_id\":\"%s_movement_%d\",\"stat_t\":\"%s\",\"avty_t\":\"%s\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"obj_id\":\"zone_%d\",",
@@ -465,7 +574,7 @@ static void publish_discovery_all(void) {
 
     /* Zone range configuration */
     const char* zone_display_names[] = {"Near", "Mid", "Far"};
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < ZONE_COUNT; ++i) {
         const char* zone_names_lower[] = {"near", "mid", "far"};
         // Start Distance
         {
@@ -570,7 +679,7 @@ static bool payload_is_press(const char *data, int len) {
     while (s < e && (unsigned char)data[s] <= ' ') s++;
     while (e > s && (unsigned char)data[e-1] <= ' ') e--;
     int n = e - s;
-    if (n == 0) return true; // empty payload treated as press
+    if (n == 0) return false;
     if (n == 1 && (data[s] == '1' || data[s] == 'P' || data[s] == 'p')) return true;
     if (n == 2 && (data[s] == 'O' || data[s] == 'o') && (data[s+1] == 'N' || data[s+1] == 'n')) return true; // ON
     if (n == 5 && (strncasecmp(&data[s], "PRESS", 5) == 0)) return true;
@@ -689,15 +798,17 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             esp_mqtt_client_subscribe(s_client, s_topic_cmd_apply_cfg, 1);
             
             /* Zone and smoothing defaults */
-            for (int i = 0; i < 3; ++i) {
+            if (s_publish_lock && xSemaphoreTake(s_publish_lock, portMAX_DELAY) == pdTRUE) {
+                normalize_zone_ranges_locked();
+                xSemaphoreGive(s_publish_lock);
+            } else {
+                normalize_zone_ranges_locked();
+            }
+            for (int i = 0; i < ZONE_COUNT; ++i) {
                 esp_mqtt_client_subscribe(s_client, s_topic_cfg_zone_min_cmd[i], 1);
                 esp_mqtt_client_subscribe(s_client, s_topic_cfg_zone_max_cmd[i], 1);
-                char v[8]; 
-                snprintf(v, sizeof(v), "%d", s_zone_min_cm[i]); 
-                pub(s_topic_cfg_zone_min_stat[i], v, 1, 1);
-                snprintf(v, sizeof(v), "%d", s_zone_max_cm[i]); 
-                pub(s_topic_cfg_zone_max_stat[i], v, 1, 1);
             }
+            publish_zone_config_states();
             esp_mqtt_client_subscribe(s_client, s_topic_cfg_smooth_cmd, 1);
             char v[8]; snprintf(v, sizeof(v), "%d", s_smooth_win); 
             pub(s_topic_cfg_smooth_stat, v, 1, 1);
@@ -830,27 +941,19 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 }
                 
                 /* Handle zone configuration commands */
-                for (int i = 0; i < 3; ++i) {
+                for (int i = 0; i < ZONE_COUNT; ++i) {
                     if (tlen == (int)strlen(s_topic_cfg_zone_min_cmd[i]) && 
                         strncmp(t, s_topic_cfg_zone_min_cmd[i], tlen) == 0) {
                         int v;
-                        if (safe_atoi(e->data, e->data_len, &v, 0, 600)) {
-                            s_zone_min_cm[i] = v;
-                            char buf[16]; 
-                            snprintf(buf, sizeof(buf), "%d", v); 
-                            pub(s_topic_cfg_zone_min_stat[i], buf, 1, 1);
-                            ESP_LOGI(TAG, "Set zone %d min: %d cm", i, v);
+                        if (safe_atoi(e->data, e->data_len, &v, 0, ZONE_DISTANCE_MAX_CM)) {
+                            set_zone_boundary(i, true, v);
                         }
                         break;
                     } else if (tlen == (int)strlen(s_topic_cfg_zone_max_cmd[i]) && 
                               strncmp(t, s_topic_cfg_zone_max_cmd[i], tlen) == 0) {
                         int v;
-                        if (safe_atoi(e->data, e->data_len, &v, 0, 600)) {
-                            s_zone_max_cm[i] = v;
-                            char buf[16]; 
-                            snprintf(buf, sizeof(buf), "%d", v); 
-                            pub(s_topic_cfg_zone_max_stat[i], buf, 1, 1);
-                            ESP_LOGI(TAG, "Set zone %d max: %d cm", i, v);
+                        if (safe_atoi(e->data, e->data_len, &v, 0, ZONE_DISTANCE_MAX_CM)) {
+                            set_zone_boundary(i, false, v);
                         }
                         break;
                     }
@@ -986,6 +1089,10 @@ void ha_mqtt_stop(void) {
     s_connected = false;
 }
 
+bool ha_mqtt_is_connected(void) {
+    return s_connected;
+}
+
 void ha_mqtt_reconnect_if_disconnected(void) {
     if (s_client && !s_connected) {
         ESP_LOGI(TAG, "Wi-Fi up, MQTT not connected - triggering immediate reconnect");
@@ -1028,7 +1135,7 @@ void ha_mqtt_publish_presence(bool present, int distance_mm) {
 
             if (present) {
                 int cur_cm = (avg_mm_snapshot + 5) / 10;
-                for (int i = 0; i < 3; ++i) {
+                for (int i = 0; i < ZONE_COUNT; ++i) {
                     int on = (cur_cm >= s_zone_min_cm[i] && cur_cm <= s_zone_max_cm[i]) ? 1 : 0;
                     if (on != s_zone_last_on[i]) {
                         s_zone_last_on[i] = on;
@@ -1036,7 +1143,7 @@ void ha_mqtt_publish_presence(bool present, int distance_mm) {
                     }
                 }
             } else {
-                for (int i = 0; i < 3; ++i) {
+                for (int i = 0; i < ZONE_COUNT; ++i) {
                     if (s_zone_last_on[i]) {
                         s_zone_last_on[i] = 0;
                         zone_updates[i] = 0;
@@ -1044,7 +1151,7 @@ void ha_mqtt_publish_presence(bool present, int distance_mm) {
                 }
             }
         } else if (!present) {
-            for (int i = 0; i < 3; ++i) {
+            for (int i = 0; i < ZONE_COUNT; ++i) {
                 if (s_zone_last_on[i]) {
                     s_zone_last_on[i] = 0;
                     zone_updates[i] = 0;
@@ -1075,7 +1182,7 @@ void ha_mqtt_publish_presence(bool present, int distance_mm) {
         pub(s_topic_movement_distance, buf, 1, 1);
     }
 
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < ZONE_COUNT; ++i) {
         if (zone_updates[i] != -1) {
             pub(s_topic_zone_movement[i], zone_updates[i] ? "ON" : "OFF", 1, 1);
         }

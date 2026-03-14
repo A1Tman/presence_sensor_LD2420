@@ -2,13 +2,18 @@
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
 
-# Keep default simple partition table (factory app + nvs + phy)
-CONFIG_PARTITION_TABLE_SINGLE_APP=y
-CONFIG_PARTITION_TABLE_FILENAME="partitions_singleapp.csv"
+# Use a custom single-app partition table with a larger factory app slot.
+# This avoids running out of room while keeping the layout simple.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Only build the SSD1306 driver family for the onboard 72x40 OLED.
+# CONFIG_U8G2_DISPLAY_DRIVER_ALL is not set
+CONFIG_U8G2_DISPLAY_DRIVER_SSD1306=y
 
 # Enable UART driver (already a default in IDF 5.x)
 CONFIG_UART_ISR_IN_IRAM=y
 
 # Console over USB-Serial-JTAG (free GPIO20/21 from UART0)
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
-CONFIG_ESP_CONSOLE_UART_NONE=y
+# CONFIG_ESP_CONSOLE_NONE is not set

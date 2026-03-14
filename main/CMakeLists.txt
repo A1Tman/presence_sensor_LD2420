@@ -1,7 +1,7 @@
 # main/CMakeLists.txt
 
 idf_component_register(
-    SRCS "main.c"
+    SRCS "main.c" "oled_status.c"
     INCLUDE_DIRS "."
     REQUIRES 
         esp_wifi 
@@ -13,4 +13,5 @@ idf_component_register(
         lwip
         ha_mqtt
         ld2420
+        nixy4__u8g2
 )

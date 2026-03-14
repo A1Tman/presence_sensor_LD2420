@@ -15,6 +15,7 @@
 
 #include "ld2420.h"  // LD2420 library
 #include "ha_mqtt.h"
+#include "oled_status.h"
 #include "../config/secrets.h"
 
 #define DEVICE_VERSION "1.2.0"
@@ -59,6 +60,10 @@ static bool s_current_presence = false;
 static int64_t s_last_movement_time = 0;
 static int s_last_distance = -1;
 static ld2420_t* s_sensor = NULL;
+static bool s_sensor_ready = false;
+static bool s_wifi_connected = false;
+static uint8_t s_ip_last_octet = 0;
+static char s_ld_fw_version[16] = "?";
 
 // LD2420 tuning (current values)
 static int s_ld_min_gate = 0;        // 0..15
@@ -83,33 +88,38 @@ static bool detect_movement(int distance_cm) {
     return (max_dist - min_dist) >= s_movement_threshold_cm;
 }
 
-static void update_presence_state(int distance_cm) {
-    // Filter invalid readings
-    if (distance_cm < DIST_MIN_VALID_CM || distance_cm > DIST_MAX_VALID_CM) return;
-
+static void update_presence_state(bool raw_present, int distance_cm) {
+    bool valid_distance = (distance_cm >= DIST_MIN_VALID_CM && distance_cm <= DIST_MAX_VALID_CM);
     int64_t now = esp_timer_get_time();
-    bool movement;
+    bool movement = false;
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    movement = detect_movement(distance_cm);
-    if (movement) {
-        s_last_movement_time = now;
-        ESP_LOGI(TAG, "Movement detected at %d cm", distance_cm);
+    if (valid_distance) {
+        movement = detect_movement(distance_cm);
+        if (movement) {
+            s_last_movement_time = now;
+            ESP_LOGI(TAG, "Movement detected at %d cm", distance_cm);
+        }
     }
-    // Present if we have recent movement
+
+    // Occupancy stays on while the radar reports presence and can still be
+    // extended briefly after movement if packets go idle or become noisy.
     int64_t time_since_movement = (now - s_last_movement_time) / 1000000LL;
-    bool presence = (movement || time_since_movement < s_presence_timeout_sec);
+    bool presence = (raw_present || movement || time_since_movement < s_presence_timeout_sec);
 
     bool should_publish = false;
-    int publish_distance_mm = 0;
-    if (presence != s_current_presence || abs(distance_cm - s_last_distance) > 3) {
-        if (presence != s_current_presence) {
-            ESP_LOGI(TAG, "Presence: %s", presence ? "ON" : "OFF");
-        }
-        s_current_presence = presence;
+    int publish_distance_mm = (s_last_distance >= 0) ? s_last_distance * 10 : -1;
+
+    if (valid_distance && (s_last_distance < 0 || abs(distance_cm - s_last_distance) > 3)) {
         s_last_distance = distance_cm;
-        should_publish = true;
         publish_distance_mm = distance_cm * 10; // Convert to mm
+        should_publish = true;
+    }
+
+    if (presence != s_current_presence) {
+        ESP_LOGI(TAG, "Presence: %s", presence ? "ON" : "OFF");
+        s_current_presence = presence;
+        should_publish = true;
     }
     xSemaphoreGive(s_state_mutex);
 
@@ -130,8 +140,6 @@ void onDetection(uint16_t distance) {
         last_distance = distance;
     }
     
-    // Update our smart presence detection
-    update_presence_state(distance);
 }
 
 // Callback for state changes
@@ -147,6 +155,9 @@ void onStateChange(LD2420_DetectionState oldState, LD2420_DetectionState newStat
 // Callback for data updates (called frequently)
 void onDataUpdate(ld2420_data_t data) {
     if (s_sensor == NULL) return;
+
+    update_presence_state(data.state == LD2420_DETECTION_ACTIVE, data.distance);
+
     // Log every 100th update to reduce spam
     static int counter = 0;
     if (++counter % 100 == 0) {
@@ -201,6 +212,49 @@ static int  get_ld_trigger_sens(void)    { xSemaphoreTake(s_state_mutex, portMAX
 static void set_ld_trigger_sens(int v)   { xSemaphoreTake(s_state_mutex, portMAX_DELAY); if (v < 0) v = 0; if (v > 65535) v = 65535; s_ld_trigger_sens = v; xSemaphoreGive(s_state_mutex); ESP_LOGI(TAG, "LD trigger_sens=%d", s_ld_trigger_sens); }
 static int  get_ld_maintain_sens(void)   { xSemaphoreTake(s_state_mutex, portMAX_DELAY); int v=s_ld_maintain_sens; xSemaphoreGive(s_state_mutex); return v; }
 static void set_ld_maintain_sens(int v)  { xSemaphoreTake(s_state_mutex, portMAX_DELAY); if (v < 0) v = 0; if (v > 65535) v = 65535; s_ld_maintain_sens = v; xSemaphoreGive(s_state_mutex); ESP_LOGI(TAG, "LD maintain_sens=%d", s_ld_maintain_sens); }
+
+static void update_ld_state_from_snapshot(const ld2420_config_snapshot_t *snapshot) {
+    if (!snapshot) return;
+
+    int min_gate = snapshot->min_gate;
+    int max_gate = snapshot->max_gate;
+    int delay_ms = snapshot->delay_ms;
+    int trig0_local = (snapshot->trigger_sensitivity > 65535U) ? 65535 : (int)snapshot->trigger_sensitivity;
+    int hold0_local = (snapshot->maintain_sensitivity > 65535U) ? 65535 : (int)snapshot->maintain_sensitivity;
+
+    if (min_gate < GATE_MIN) min_gate = GATE_MIN;
+    if (min_gate > GATE_MAX) min_gate = GATE_MAX;
+    if (max_gate < GATE_MIN) max_gate = GATE_MIN;
+    if (max_gate > GATE_MAX) max_gate = GATE_MAX;
+    if (min_gate > max_gate) max_gate = min_gate;
+    if (delay_ms < DELAY_MIN_MS) delay_ms = DELAY_MIN_MS;
+    if (delay_ms > DELAY_MAX_MS) delay_ms = DELAY_MAX_MS;
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_ld_min_gate = min_gate;
+    s_ld_max_gate = max_gate;
+    s_ld_delay_ms = delay_ms;
+    s_ld_trigger_sens = trig0_local;
+    s_ld_maintain_sens = hold0_local;
+    xSemaphoreGive(s_state_mutex);
+}
+
+static esp_err_t sync_ld_config_from_sensor(void) {
+    if (!s_sensor) return ESP_ERR_INVALID_STATE;
+
+    ld2420_config_snapshot_t snapshot = {0};
+    esp_err_t err = ld2420_read_config(s_sensor, &snapshot);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Unable to sync LD2420 config from sensor (%s)", esp_err_to_name(err));
+        return err;
+    }
+
+    update_ld_state_from_snapshot(&snapshot);
+    ESP_LOGI(TAG, "Synced LD2420 config: min_gate=%d max_gate=%d delay_ms=%d trig0=%" PRIu32 " maintain0=%" PRIu32,
+             snapshot.min_gate, snapshot.max_gate, snapshot.delay_ms,
+             snapshot.trigger_sensitivity, snapshot.maintain_sensitivity);
+    return ESP_OK;
+}
 
 static void apply_ld_config(void) {
     if (!s_sensor) return;
@@ -288,13 +342,7 @@ static void apply_ld_config(void) {
                     ((int)applied.trigger_sensitivity != trig0_local) ||
                     ((int)applied.maintain_sensitivity != hold0_local);
 
-    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    s_ld_min_gate = applied.min_gate;
-    s_ld_max_gate = applied.max_gate;
-    s_ld_delay_ms = applied.delay_ms;
-    s_ld_trigger_sens = (applied.trigger_sensitivity > 65535U) ? 65535 : (int)applied.trigger_sensitivity;
-    s_ld_maintain_sens = (applied.maintain_sensitivity > 65535U) ? 65535 : (int)applied.maintain_sensitivity;
-    xSemaphoreGive(s_state_mutex);
+    update_ld_state_from_snapshot(&applied);
 
     if (!write_ok) {
         ESP_LOGW(TAG, "One or more LD2420 config writes reported errors");
@@ -303,6 +351,40 @@ static void apply_ld_config(void) {
         ESP_LOGW(TAG, "LD2420 applied values differ from requested");
     } else if (write_ok) {
         ESP_LOGI(TAG, "LD2420 configuration verified");
+    }
+}
+
+static void collect_oled_snapshot(oled_status_snapshot_t *out_snapshot) {
+    if (out_snapshot == NULL || s_state_mutex == NULL) {
+        return;
+    }
+
+    memset(out_snapshot, 0, sizeof(*out_snapshot));
+    out_snapshot->distance_cm = -1;
+    out_snapshot->rssi_dbm = 0;
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    out_snapshot->sensor_ready = s_sensor_ready;
+    out_snapshot->sensor_packets_valid = (s_sensor != NULL) && s_sensor->current_data.isValid;
+    out_snapshot->presence = s_current_presence;
+    out_snapshot->wifi_connected = s_wifi_connected;
+    out_snapshot->ip_last_octet = s_ip_last_octet;
+    out_snapshot->distance_cm = s_last_distance;
+    out_snapshot->min_gate = s_ld_min_gate;
+    out_snapshot->max_gate = s_ld_max_gate;
+    out_snapshot->delay_ms = s_ld_delay_ms;
+    out_snapshot->trigger_sens = s_ld_trigger_sens;
+    out_snapshot->maintain_sens = s_ld_maintain_sens;
+    snprintf(out_snapshot->fw_version, sizeof(out_snapshot->fw_version), "%s", s_ld_fw_version);
+    xSemaphoreGive(s_state_mutex);
+
+    out_snapshot->mqtt_connected = ha_mqtt_is_connected();
+
+    if (out_snapshot->wifi_connected) {
+        wifi_ap_record_t ap_info = {0};
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+            out_snapshot->rssi_dbm = ap_info.rssi;
+        }
     }
 }
 
@@ -363,6 +445,15 @@ static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (s_state_mutex != NULL) {
+            xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+            s_wifi_connected = false;
+            s_ip_last_octet = 0;
+            xSemaphoreGive(s_state_mutex);
+        }
+        if (s_wifi_event_group != NULL) {
+            xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        }
         esp_wifi_connect();
         s_retry_num++;
         ESP_LOGW(TAG, "WiFi disconnected, retry #%d", s_retry_num);
@@ -373,6 +464,12 @@ static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         if (event_data == NULL) return;
         ip_event_got_ip_t* event = (ip_event_got_ip_t*)event_data;
+        if (s_state_mutex != NULL) {
+            xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+            s_wifi_connected = true;
+            s_ip_last_octet = (uint8_t)esp_ip4_addr4(&event->ip_info.ip);
+            xSemaphoreGive(s_state_mutex);
+        }
         ESP_LOGI(TAG, "WiFi connected: " IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
@@ -441,13 +538,10 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    // Initialize WiFi and MQTT
-    ESP_LOGI(TAG, "Starting WiFi...");
-    esp_err_t wifi_rc = wifi_init();
-    if (wifi_rc != ESP_OK) {
-        ESP_LOGW(TAG, "wifi_init returned %s; continuing, background retries may proceed", esp_err_to_name(wifi_rc));
+    if (!oled_status_init(collect_oled_snapshot, DEVICE_VERSION)) {
+        ESP_LOGW(TAG, "OLED status display init failed");
     }
-    
+
     // LD2420 INITIALIZATION
     s_sensor = ld2420_create();
     if (s_sensor == NULL) {
@@ -468,14 +562,25 @@ void app_main(void) {
         return;
     }
 
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_sensor_ready = true;
+    xSemaphoreGive(s_state_mutex);
     ESP_LOGI(TAG, "✓ Sensor initialized successfully");
+    sync_ld_config_from_sensor();
+
     // Read firmware version and publish (diagnostic)
     {
         char fw[48];
         if (ld2420_read_firmware_version(s_sensor, fw, sizeof(fw)) == ESP_OK) {
+            xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+            snprintf(s_ld_fw_version, sizeof(s_ld_fw_version), "%.15s", fw);
+            xSemaphoreGive(s_state_mutex);
             ESP_LOGI(TAG, "LD2420 FW: %s", fw);
             ha_mqtt_publish_fw_version(fw);
         } else {
+            xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+            snprintf(s_ld_fw_version, sizeof(s_ld_fw_version), "%s", "?");
+            xSemaphoreGive(s_state_mutex);
             ESP_LOGW(TAG, "Unable to read LD2420 firmware version");
         }
     }
@@ -497,6 +602,14 @@ void app_main(void) {
     ESP_LOGI(TAG, "Movement threshold: %d cm, Presence timeout: %d sec", 
              s_movement_threshold_cm, s_presence_timeout_sec);
     ESP_LOGI(TAG, "");
+
+    // Initialize WiFi and MQTT after the sensor state is fully synchronized so
+    // Home Assistant sees the actual LD2420 config on first connect.
+    ESP_LOGI(TAG, "Starting WiFi...");
+    esp_err_t wifi_rc = wifi_init();
+    if (wifi_rc != ESP_OK) {
+        ESP_LOGW(TAG, "wifi_init returned %s; continuing, background retries may proceed", esp_err_to_name(wifi_rc));
+    }
     
     // MAIN LOOP WITH MQTT ADDITIONS
     bool last_ot2_state = false;
