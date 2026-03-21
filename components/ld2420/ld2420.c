@@ -74,15 +74,6 @@ const uint8_t DATA_FOOTER[] = {0xF8, 0xF7, 0xF6, 0xF5};
 #define MODE_DEBUG   0x0000  // Raw waveform data
 #define MODE_SIMPLE  0x0064  // Text output
 
-// Helper function to log hex data
-static void log_buffer_hex(const char* tag, const uint8_t* buffer, size_t len) {
-    char hex_str[len * 3 + 1];
-    for (size_t i = 0; i < len; i++) {
-        snprintf(hex_str + i * 3, 4, "%02X ", buffer[i]);
-    }
-    ESP_LOGD(tag, "%s", hex_str);
-}
-
 // Send raw command frame
 static esp_err_t send_command(ld2420_t* sensor, const uint8_t* cmd_data, size_t cmd_len) {
     if (!sensor) return ESP_ERR_INVALID_ARG;

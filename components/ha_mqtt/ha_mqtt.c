@@ -26,7 +26,7 @@ static ha_mqtt_cfg_t s_cfg = {
     .password      = NULL,
     .friendly_name = "Radar Sensor",
     .suggested_area= NULL,
-    .app_version   = "1.3.0",
+    .app_version   = "1.4.0",
     .distance_supported = true,
     .broker_ca_cert_pem = NULL,
 };
@@ -41,6 +41,7 @@ static char s_broker_uri[128];
 /* Derived identifiers & topics */
 static char s_mac_str[18];              // AA:BB:CC:DD:EE:FF
 static char s_devid[32];                // presence-aabbcc
+static char s_entity_slug[32];          // presence_aabbcc
 static char s_topic_base[64];           // presence/presence-aabbcc
 static char s_topic_status[96];
 static char s_topic_presence[96];
@@ -76,6 +77,8 @@ static char s_topic_cmd_apply_cfg[96];
 #define SMOOTH_BUFFER_SIZE 16
 #define ZONE_COUNT 3
 #define ZONE_DISTANCE_MAX_CM 600
+#define MQTT_RX_TOPIC_MAX_LEN   128
+#define MQTT_RX_PAYLOAD_MAX_LEN 256
 static int  s_smooth_win = 5;
 static int  s_smooth_ring[SMOOTH_BUFFER_SIZE];
 static int  s_smooth_count = 0;
@@ -102,6 +105,7 @@ static char s_disc_button_resend_disc[128];
 static char s_disc_button_apply_cfg[128];
 static char s_disc_sensor_fwver[128];
 static bool s_restart_migration_done = false;
+static bool s_ld_hold00_cleanup_done = false;
 
 /* Cached state for reconnect */
 static bool s_have_last = false;
@@ -116,6 +120,17 @@ static int64_t s_last_diag_us = 0;
 static int64_t s_last_restart_us = 0;
 static int64_t s_last_apply_us = 0;
 
+typedef struct {
+    bool active;
+    bool overflow;
+    int expected_len;
+    int topic_len;
+    char topic[MQTT_RX_TOPIC_MAX_LEN];
+    char data[MQTT_RX_PAYLOAD_MAX_LEN + 1];
+} mqtt_rx_assembly_t;
+
+static mqtt_rx_assembly_t s_mqtt_rx = {0};
+
 #define RESTART_MIN_INTERVAL_US (30LL * 1000000LL)
 #define APPLY_MIN_INTERVAL_US   (5LL  * 1000000LL)
 
@@ -125,6 +140,43 @@ static void pub(const char *topic, const char *payload, int qos, int retain);
 static void mac_to_str(uint8_t mac[6], char out[18]) {
     snprintf(out, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+static void make_entity_slug(const char *src, char *out, size_t out_size) {
+    if (!out || out_size == 0) return;
+
+    size_t j = 0;
+    bool last_was_sep = false;
+    if (src) {
+        for (size_t i = 0; src[i] != '\0' && j + 1 < out_size; ++i) {
+            unsigned char c = (unsigned char)src[i];
+            if (isalnum(c)) {
+                out[j++] = (char)tolower(c);
+                last_was_sep = false;
+            } else if (!last_was_sep) {
+                out[j++] = '_';
+                last_was_sep = true;
+            }
+        }
+    }
+
+    while (j > 0 && out[j - 1] == '_') {
+        --j;
+    }
+    if (j == 0) {
+        out[j++] = 'e';
+    }
+    out[j] = '\0';
+}
+
+static void append_default_entity_id(char *payload, size_t payload_size, int *len,
+                                     const char *domain, const char *suffix) {
+    if (!payload || !len || !domain || !suffix) return;
+    if (*len < 0 || (size_t)*len >= payload_size) return;
+
+    *len += snprintf(payload + *len, payload_size - (size_t)*len,
+                     "\"default_entity_id\":\"%s.%s_%s\",",
+                     domain, s_entity_slug, suffix);
 }
 
 /* Safe string to integer conversion with validation */
@@ -152,6 +204,78 @@ static bool safe_atoi(const char *str, int len, int *out_val, int min, int max) 
     }
     
     *out_val = (int)val;
+    return true;
+}
+
+static void mqtt_rx_reset(void) {
+    memset(&s_mqtt_rx, 0, sizeof(s_mqtt_rx));
+}
+
+static bool mqtt_event_get_complete_payload(esp_mqtt_event_handle_t e,
+                                            const char **topic, int *topic_len,
+                                            const char **data, int *data_len) {
+    if (!e || !topic || !topic_len || !data || !data_len) {
+        return false;
+    }
+
+    if (e->total_data_len <= 0 ||
+        (e->current_data_offset == 0 && e->data_len == e->total_data_len)) {
+        *topic = e->topic;
+        *topic_len = e->topic_len;
+        *data = e->data;
+        *data_len = e->data_len;
+        return true;
+    }
+
+    if (e->current_data_offset == 0) {
+        mqtt_rx_reset();
+        s_mqtt_rx.active = true;
+        s_mqtt_rx.expected_len = e->total_data_len;
+
+        if (e->topic_len >= MQTT_RX_TOPIC_MAX_LEN) {
+            s_mqtt_rx.overflow = true;
+            ESP_LOGW(TAG, "Dropping MQTT command with topic length %d", e->topic_len);
+        } else if (e->topic && e->topic_len > 0) {
+            memcpy(s_mqtt_rx.topic, e->topic, e->topic_len);
+            s_mqtt_rx.topic[e->topic_len] = '\0';
+            s_mqtt_rx.topic_len = e->topic_len;
+        }
+    } else if (!s_mqtt_rx.active) {
+        ESP_LOGW(TAG, "Dropping MQTT fragment without an active message");
+        return false;
+    }
+
+    if (e->current_data_offset < 0 || e->data_len < 0 ||
+        (e->current_data_offset + e->data_len) > e->total_data_len) {
+        ESP_LOGW(TAG, "Dropping invalid MQTT fragment offset=%d len=%d total=%d",
+                 e->current_data_offset, e->data_len, e->total_data_len);
+        mqtt_rx_reset();
+        return false;
+    }
+
+    if ((e->current_data_offset + e->data_len) > MQTT_RX_PAYLOAD_MAX_LEN) {
+        s_mqtt_rx.overflow = true;
+    } else if (!s_mqtt_rx.overflow && e->data && e->data_len > 0) {
+        memcpy(s_mqtt_rx.data + e->current_data_offset, e->data, e->data_len);
+    }
+
+    if ((e->current_data_offset + e->data_len) < e->total_data_len) {
+        return false;
+    }
+
+    if (s_mqtt_rx.overflow) {
+        ESP_LOGW(TAG, "Dropping MQTT command payload larger than %d bytes",
+                 MQTT_RX_PAYLOAD_MAX_LEN);
+        mqtt_rx_reset();
+        return false;
+    }
+
+    s_mqtt_rx.data[s_mqtt_rx.expected_len] = '\0';
+    *topic = s_mqtt_rx.topic;
+    *topic_len = s_mqtt_rx.topic_len;
+    *data = s_mqtt_rx.data;
+    *data_len = s_mqtt_rx.expected_len;
+    mqtt_rx_reset();
     return true;
 }
 
@@ -267,6 +391,7 @@ static void derive_ids_and_topics(void) {
 
     /* short hex id (last 3 bytes) */
     snprintf(s_devid, sizeof(s_devid), "presence-%02x%02x%02x", mac[3], mac[4], mac[5]);
+    make_entity_slug(s_devid, s_entity_slug, sizeof(s_entity_slug));
 
     /* Use custom discovery prefix if provided */
     if (s_cfg.discovery_prefix && s_cfg.discovery_prefix[0]) {
@@ -334,9 +459,25 @@ static void derive_ids_and_topics(void) {
              "%s/button/%s/apply_config/config", s_disc_prefix, s_devid);
 }
 
+static bool should_downgrade_publish_qos(const char *topic) {
+    if (!topic) {
+        return false;
+    }
+
+    size_t discovery_len = strlen(s_disc_prefix);
+    if (discovery_len > 0 &&
+        strncmp(topic, s_disc_prefix, discovery_len) == 0 &&
+        topic[discovery_len] == '/') {
+        return true;
+    }
+
+    return strstr(topic, "/cfg/") != NULL;
+}
+
 static void pub(const char *topic, const char *payload, int qos, int retain) {
     if (!s_client || !s_connected) return;
-    int mid = esp_mqtt_client_publish(s_client, topic, payload, 0, qos, retain);
+    int effective_qos = should_downgrade_publish_qos(topic) ? 0 : qos;
+    int mid = esp_mqtt_client_publish(s_client, topic, payload, 0, effective_qos, retain);
     if (mid < 0) ESP_LOGW(TAG, "Publish failed to %s", topic);
 }
 
@@ -386,12 +527,12 @@ static void publish_discovery_all(void) {
             "\"dev_cla\":\"occupancy\","
             "\"pl_on\":\"ON\",\"pl_off\":\"OFF\","
             "\"avty_t\":\"%s\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\","
-            "\"json_attr_t\":\"%s\","
-            "\"obj_id\":\"presence\",",
+            "\"json_attr_t\":\"%s\",",
             s_devid, s_topic_presence,
             s_topic_status,
             s_topic_attrs
         );
+        append_default_entity_id(payload, sizeof(payload), &len, "binary_sensor", "presence");
         len += snprintf(payload+len, sizeof(payload)-len, "%s", dev_block);
         len += snprintf(payload+len, sizeof(payload)-len, "}");
         pub(s_disc_bs_presence, payload, 1, 1);
@@ -408,11 +549,11 @@ static void publish_discovery_all(void) {
             "\"stat_t\":\"%s\","
             "\"dev_cla\":\"distance\","
             "\"unit_of_meas\":\"cm\",\"stat_cla\":\"measurement\","
-            "\"avty_t\":\"%s\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\","
-            "\"obj_id\":\"distance\",",
+            "\"avty_t\":\"%s\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",",
             s_devid, s_topic_movement_distance,
             s_topic_status
         );
+        append_default_entity_id(payload, sizeof(payload), &len, "sensor", "distance");
         len += snprintf(payload+len, sizeof(payload)-len, "%s", dev_block);
         len += snprintf(payload+len, sizeof(payload)-len, "}");
         pub(s_disc_sensor_movement, payload, 1, 1);
@@ -428,11 +569,11 @@ static void publish_discovery_all(void) {
             "\"uniq_id\":\"%s_rssi\","
             "\"stat_t\":\"%s\","
             "\"dev_cla\":\"signal_strength\",\"unit_of_meas\":\"dBm\",\"ent_cat\":\"diagnostic\","
-            "\"avty_t\":\"%s\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\","
-            "\"obj_id\":\"signal\",",
+            "\"avty_t\":\"%s\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",",
             s_devid, s_topic_rssi,
             s_topic_status
         );
+        append_default_entity_id(payload, sizeof(payload), &len, "sensor", "signal");
         len += snprintf(payload+len, sizeof(payload)-len, "%s", dev_block);
         len += snprintf(payload+len, sizeof(payload)-len, "}");
         pub(s_disc_sensor_rssi, payload, 1, 1);
@@ -448,11 +589,11 @@ static void publish_discovery_all(void) {
             "\"uniq_id\":\"%s_uptime\","
             "\"stat_t\":\"%s\","
             "\"unit_of_meas\":\"s\",\"stat_cla\":\"measurement\",\"ent_cat\":\"diagnostic\","
-            "\"avty_t\":\"%s\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\","
-            "\"obj_id\":\"uptime\",",
+            "\"avty_t\":\"%s\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",",
             s_devid, s_topic_uptime,
             s_topic_status
         );
+        append_default_entity_id(payload, sizeof(payload), &len, "sensor", "uptime");
         len += snprintf(payload+len, sizeof(payload)-len, "%s", dev_block);
         len += snprintf(payload+len, sizeof(payload)-len, "}");
         pub(s_disc_sensor_uptime, payload, 1, 1);
@@ -468,8 +609,9 @@ static void publish_discovery_all(void) {
             "\"uniq_id\":\"%s_ld_fw\","
             "\"stat_t\":\"%s\","
             "\"avty_t\":\"%s\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\","
-            "\"ent_cat\":\"diagnostic\",\"obj_id\":\"ld_fw\",",
+            "\"ent_cat\":\"diagnostic\",",
             s_devid, s_topic_fwver, s_topic_status);
+        append_default_entity_id(payload, sizeof(payload), &len, "sensor", "ld_fw");
         len += snprintf(payload+len, sizeof(payload)-len, "%s", dev_block);
         len += snprintf(payload+len, sizeof(payload)-len, "}");
         pub(s_disc_sensor_fwver, payload, 1, 1);
@@ -564,8 +706,11 @@ static void publish_discovery_all(void) {
     for (int i = 0; i < ZONE_COUNT; ++i) {
         char payload[1024]; int len=0;
         len += snprintf(payload+len, sizeof(payload)-len,
-            "{\"name\":\"%s\",\"uniq_id\":\"%s_movement_%d\",\"stat_t\":\"%s\",\"avty_t\":\"%s\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"obj_id\":\"zone_%d\",",
-            zone_names[i], s_devid, i+1, s_topic_zone_movement[i], s_topic_status, i+1);
+            "{\"name\":\"%s\",\"uniq_id\":\"%s_movement_%d\",\"stat_t\":\"%s\",\"avty_t\":\"%s\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",",
+            zone_names[i], s_devid, i+1, s_topic_zone_movement[i], s_topic_status);
+        char zone_suffix[16];
+        snprintf(zone_suffix, sizeof(zone_suffix), "zone_%d", i + 1);
+        append_default_entity_id(payload, sizeof(payload), &len, "binary_sensor", zone_suffix);
         len += snprintf(payload+len, sizeof(payload)-len, "%s", dev_block);
         len += snprintf(payload+len, sizeof(payload)-len, "}");
         char disc[192]; snprintf(disc, sizeof(disc), "%s/binary_sensor/%s/movement_%d/config", s_disc_prefix, s_devid, i+1);
@@ -614,9 +759,17 @@ static void publish_discovery_all(void) {
 
     /* Action buttons */
     {
+        if (!s_ld_hold00_cleanup_done) {
+            char legacy_disc[192];
+            snprintf(legacy_disc, sizeof(legacy_disc), "%s/number/%s/ld_hold00/config", s_disc_prefix, s_devid);
+            pub(legacy_disc, "", 1, 1);
+            s_ld_hold00_cleanup_done = true;
+        }
+    }
+    {
         char payload[512]; int len=0;
         if (!s_restart_migration_done) {
-            esp_mqtt_client_publish(s_client, s_disc_button_restart, "", 0, 1, 1);
+            pub(s_disc_button_restart, "", 0, 1);
             s_restart_migration_done = true;
         }
         len += snprintf(payload+len, sizeof(payload)-len,
@@ -687,6 +840,30 @@ static bool payload_is_press(const char *data, int len) {
     return false;
 }
 
+static void log_mqtt_error_event(esp_mqtt_event_handle_t e) {
+    if (!e || !e->error_handle) {
+        ESP_LOGE(TAG, "MQTT error event without details");
+        return;
+    }
+
+    const esp_mqtt_error_codes_t *err = e->error_handle;
+    ESP_LOGE(TAG,
+             "MQTT error: type=%d protocol=%d connect_rc=%d tls_esp=0x%x tls_stack=%d verify=0x%x sock_errno=%d",
+             err->error_type,
+             e->protocol_ver,
+             err->connect_return_code,
+             err->esp_tls_last_esp_err,
+             err->esp_tls_stack_err,
+             err->esp_tls_cert_verify_flags,
+             err->esp_transport_sock_errno);
+
+#if CONFIG_MQTT_PROTOCOL_5
+    if (e->protocol_ver == MQTT_PROTOCOL_V_5 && err->disconnect_return_code != 0) {
+        ESP_LOGE(TAG, "MQTT 5 disconnect reason: 0x%02x", err->disconnect_return_code);
+    }
+#endif
+}
+
 static void publish_birth_online(void) {
     pub(s_topic_status, "online", 1, 1);
 }
@@ -745,7 +922,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     switch (event_id) {
         case MQTT_EVENT_CONNECTED:
             s_connected = true;
-            ESP_LOGI(TAG, "MQTT connected");
+            ESP_LOGI(TAG, "MQTT connected (protocol=%d, session_present=%d)",
+                     e ? e->protocol_ver : -1,
+                     e ? e->session_present : 0);
             
             publish_discovery_all();
             publish_birth_online();
@@ -854,10 +1033,20 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             ESP_LOGW(TAG, "MQTT disconnected");
             break;
 
+        case MQTT_EVENT_ERROR:
+            s_connected = false;
+            log_mqtt_error_event(e);
+            break;
+
         case MQTT_EVENT_DATA:
-            if (e && e->topic && e->data) {
-                const char *t = e->topic; 
-                int tlen = e->topic_len;
+            if (e && e->data) {
+                const char *t = NULL;
+                const char *payload = NULL;
+                int tlen = 0;
+                int payload_len = 0;
+                if (!mqtt_event_get_complete_payload(e, &t, &tlen, &payload, &payload_len)) {
+                    break;
+                }
                 
                 /* Handle movement threshold command */
                 if (s_cfg.set_distance_thresh_cm && 
@@ -865,7 +1054,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     strncmp(t, s_topic_cfg_movement_thresh_cmd, tlen) == 0) {
                     
                     int v;
-                    if (safe_atoi(e->data, e->data_len, &v, 1, 50)) {
+                    if (safe_atoi(payload, payload_len, &v, 1, 50)) {
                         s_cfg.set_distance_thresh_cm(v);
                         char buf[16]; 
                         snprintf(buf, sizeof(buf), "%d", v); 
@@ -881,7 +1070,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                           strncmp(t, s_topic_cfg_presence_timeout_cmd, tlen) == 0) {
                     
                     int v;
-                    if (safe_atoi(e->data, e->data_len, &v, 5, 300)) {
+                    if (safe_atoi(payload, payload_len, &v, 5, 300)) {
                         // Convert seconds from HA to milliseconds for internal use
                         s_cfg.set_hold_on_ms(v * 1000);
                         char buf[16]; 
@@ -895,7 +1084,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 /* Handle LD2420 tuning commands (typed setters) */
                 } else if (tlen == (int)strlen(s_topic_cfg_ld_min_cmd) && strncmp(t, s_topic_cfg_ld_min_cmd, tlen) == 0) {
                     if (s_cfg.set_ld_min_gate) {
-                        int v; if (safe_atoi(e->data, e->data_len, &v, 0, 15)) {
+                        int v; if (safe_atoi(payload, payload_len, &v, 0, 15)) {
                             s_cfg.set_ld_min_gate(v);
                             char buf[16]; snprintf(buf, sizeof(buf), "%d", s_cfg.get_ld_min_gate ? s_cfg.get_ld_min_gate() : v);
                             pub(s_topic_cfg_ld_min_stat, buf, 1, 1);
@@ -904,7 +1093,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     }
                 } else if (tlen == (int)strlen(s_topic_cfg_ld_max_cmd) && strncmp(t, s_topic_cfg_ld_max_cmd, tlen) == 0) {
                     if (s_cfg.set_ld_max_gate) {
-                        int v; if (safe_atoi(e->data, e->data_len, &v, 0, 15)) {
+                        int v; if (safe_atoi(payload, payload_len, &v, 0, 15)) {
                             s_cfg.set_ld_max_gate(v);
                             char buf[16]; snprintf(buf, sizeof(buf), "%d", s_cfg.get_ld_max_gate ? s_cfg.get_ld_max_gate() : v);
                             pub(s_topic_cfg_ld_max_stat, buf, 1, 1);
@@ -913,7 +1102,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     }
                 } else if (tlen == (int)strlen(s_topic_cfg_ld_delay_cmd) && strncmp(t, s_topic_cfg_ld_delay_cmd, tlen) == 0) {
                     if (s_cfg.set_ld_delay_ms) {
-                        int v; if (safe_atoi(e->data, e->data_len, &v, 0, 65535)) {
+                        int v; if (safe_atoi(payload, payload_len, &v, 0, 65535)) {
                             s_cfg.set_ld_delay_ms(v);
                             char buf[16]; snprintf(buf, sizeof(buf), "%d", s_cfg.get_ld_delay_ms ? s_cfg.get_ld_delay_ms() : v);
                             pub(s_topic_cfg_ld_delay_stat, buf, 1, 1);
@@ -922,7 +1111,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     }
                 } else if (tlen == (int)strlen(s_topic_cfg_ld_trig0_cmd) && strncmp(t, s_topic_cfg_ld_trig0_cmd, tlen) == 0) {
                     if (s_cfg.set_ld_trigger_sens) {
-                        int v; if (safe_atoi(e->data, e->data_len, &v, 0, 65535)) {
+                        int v; if (safe_atoi(payload, payload_len, &v, 0, 65535)) {
                             s_cfg.set_ld_trigger_sens(v);
                             char buf[16]; snprintf(buf, sizeof(buf), "%d", s_cfg.get_ld_trigger_sens ? s_cfg.get_ld_trigger_sens() : v);
                             pub(s_topic_cfg_ld_trig0_stat, buf, 1, 1);
@@ -931,7 +1120,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     }
                 } else if (tlen == (int)strlen(s_topic_cfg_ld_hold0_cmd) && strncmp(t, s_topic_cfg_ld_hold0_cmd, tlen) == 0) {
                     if (s_cfg.set_ld_maintain_sens) {
-                        int v; if (safe_atoi(e->data, e->data_len, &v, 0, 65535)) {
+                        int v; if (safe_atoi(payload, payload_len, &v, 0, 65535)) {
                             s_cfg.set_ld_maintain_sens(v);
                             char buf[16]; snprintf(buf, sizeof(buf), "%d", s_cfg.get_ld_maintain_sens ? s_cfg.get_ld_maintain_sens() : v);
                             pub(s_topic_cfg_ld_hold0_stat, buf, 1, 1);
@@ -945,14 +1134,14 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     if (tlen == (int)strlen(s_topic_cfg_zone_min_cmd[i]) && 
                         strncmp(t, s_topic_cfg_zone_min_cmd[i], tlen) == 0) {
                         int v;
-                        if (safe_atoi(e->data, e->data_len, &v, 0, ZONE_DISTANCE_MAX_CM)) {
+                        if (safe_atoi(payload, payload_len, &v, 0, ZONE_DISTANCE_MAX_CM)) {
                             set_zone_boundary(i, true, v);
                         }
                         break;
                     } else if (tlen == (int)strlen(s_topic_cfg_zone_max_cmd[i]) && 
                               strncmp(t, s_topic_cfg_zone_max_cmd[i], tlen) == 0) {
                         int v;
-                        if (safe_atoi(e->data, e->data_len, &v, 0, ZONE_DISTANCE_MAX_CM)) {
+                        if (safe_atoi(payload, payload_len, &v, 0, ZONE_DISTANCE_MAX_CM)) {
                             set_zone_boundary(i, false, v);
                         }
                         break;
@@ -963,7 +1152,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 if (tlen == (int)strlen(s_topic_cfg_smooth_cmd) && 
                     strncmp(t, s_topic_cfg_smooth_cmd, tlen) == 0) {
                     int v;
-                    if (safe_atoi(e->data, e->data_len, &v, 1, 10)) {
+                    if (safe_atoi(payload, payload_len, &v, 1, 10)) {
                         s_smooth_win = v;
                         char buf[16]; 
                         snprintf(buf, sizeof(buf), "%d", v); 
@@ -974,7 +1163,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
                 /* Action buttons */
                 if (tlen == (int)strlen(s_topic_cmd_restart) && strncmp(t, s_topic_cmd_restart, tlen) == 0) {
-                    if (payload_is_press(e->data, e->data_len)) {
+                    if (payload_is_press(payload, payload_len)) {
                         int64_t now = esp_timer_get_time();
                         if (now - s_last_restart_us < RESTART_MIN_INTERVAL_US) {
                             ESP_LOGW(TAG, "Restart ignored: rate limited");
@@ -987,12 +1176,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                         }
                     }
                 } else if (tlen == (int)strlen(s_topic_cmd_resend_disc) && strncmp(t, s_topic_cmd_resend_disc, tlen) == 0) {
-                    if (payload_is_press(e->data, e->data_len)) {
+                    if (payload_is_press(payload, payload_len)) {
                         ESP_LOGI(TAG, "MQTT resend discovery requested");
                         ha_mqtt_resend_discovery();
                     }
                 } else if (tlen == (int)strlen(s_topic_cmd_apply_cfg) && strncmp(t, s_topic_cmd_apply_cfg, tlen) == 0) {
-                    if (payload_is_press(e->data, e->data_len)) {
+                    if (payload_is_press(payload, payload_len)) {
                         int64_t now = esp_timer_get_time();
                         if (now - s_last_apply_us < APPLY_MIN_INTERVAL_US) {
                             ESP_LOGW(TAG, "Apply config ignored: rate limited");
@@ -1060,6 +1249,7 @@ void ha_mqtt_start(void) {
             .authentication.password = s_cfg.password
         },
         .session = {
+            .protocol_ver = MQTT_PROTOCOL_V_5,
             .keepalive = 15,
             .last_will = {
                 .topic   = s_topic_status,
@@ -1068,7 +1258,14 @@ void ha_mqtt_start(void) {
                 .retain  = 1
             }
         },
-        .network.timeout_ms = 5000,
+        .network = {
+            .timeout_ms = 5000,
+            .reconnect_timeout_ms = 5000,
+        },
+        .buffer = {
+            .size = 2048,
+            .out_size = 2048,
+        },
     };
 
     s_client = esp_mqtt_client_init(&mc);
@@ -1076,6 +1273,25 @@ void ha_mqtt_start(void) {
         ESP_LOGE(TAG, "Failed to initialize MQTT client");
         return;
     }
+
+#if CONFIG_MQTT_PROTOCOL_5
+    esp_mqtt5_connection_property_config_t connect_props = {
+        .session_expiry_interval = 0,
+        .maximum_packet_size = 2048,
+        .receive_maximum = 32,
+        .topic_alias_maximum = 0,
+        .request_resp_info = false,
+        .request_problem_info = true,
+    };
+    esp_err_t mqtt5_err = esp_mqtt5_client_set_connect_property(s_client, &connect_props);
+    if (mqtt5_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure MQTT 5 connect properties: %s",
+                 esp_err_to_name(mqtt5_err));
+        esp_mqtt_client_destroy(s_client);
+        s_client = NULL;
+        return;
+    }
+#endif
     
     esp_mqtt_client_register_event(s_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
     esp_mqtt_client_start(s_client);

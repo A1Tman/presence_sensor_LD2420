@@ -18,7 +18,7 @@
 #include "oled_status.h"
 #include "../config/secrets.h"
 
-#define DEVICE_VERSION "1.3.0"
+#define DEVICE_VERSION "1.4.0"
 
 // ==================== CONSTANTS ====================
 #define DIST_MIN_VALID_CM          10
