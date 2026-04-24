@@ -21,6 +21,11 @@ typedef struct {
     // unless the broker_uri already specifies mqtts://.
     const char *broker_ca_cert_pem; // NULL-terminated PEM string
 
+    // Enables MQTT command entities and subscriptions for config sliders and
+    // action buttons. Keep this false unless broker ACLs or explicit local
+    // policy protect the command topics.
+    bool command_topics_enabled;
+
     // Optional: legacy node IDs used in previous firmware versions.
     // If provided, the integration will publish empty retained discovery
     // configs to these old IDs to let Home Assistant remove duplicate entities.
@@ -95,7 +100,7 @@ bool ha_mqtt_is_connected(void);
 /** Publish presence + optional distance (mm). distance_mm < 0 if unknown. */
 void ha_mqtt_publish_presence(bool present, int distance_mm);
 
-/** Optionally publish RSSI immediately (otherwise it’s sent periodically). */
+/** Optionally publish RSSI immediately (otherwise it is sent periodically). */
 void ha_mqtt_publish_rssi_now(void);
 
 /** Optionally force re-sending HA discovery configs (retained). */
@@ -109,8 +114,10 @@ void ha_mqtt_diag_publish_uart(int alive, int baud);
 void ha_mqtt_publish_dir_approach(int on);
 void ha_mqtt_publish_dir_away(int on);
 
-// Publish LD2420 firmware version (diagnostic sensor)
-void ha_mqtt_publish_fw_version(const char *version);
+// Publish the LD2420 module firmware version as a diagnostic sensor.
+// The ESP application firmware version is advertised separately as device
+// sw_version from ha_mqtt_cfg_t.app_version.
+void ha_mqtt_publish_ld2420_fw_version(const char *version);
 
 #ifdef __cplusplus
 }

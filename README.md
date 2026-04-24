@@ -39,7 +39,7 @@ This firmware publishes HA discovery. After boot you’ll see a device with:
 The onboard 72x40 OLED mirrors key local state without needing Home Assistant:
 
 - Page 1: presence, distance, Wi‑Fi RSSI, MQTT state, IP suffix
-- Page 2: LD2420 min/max gate, delay, trigger, tracking, firmware
+- Page 2: LD2420 min/max gate, delay, trigger, tracking, LD2420 firmware
 - Fault override: radar init/no-data, Wi‑Fi down, or MQTT waiting
 
 Buttons only act on press and are rate‑limited. “Apply Config” writes your staged LD2420 values over UART in command mode.
@@ -91,8 +91,8 @@ Upload (“energy”) data:
 ## Security
 
 - TLS: define a CA PEM in `config/secrets.h`; the client switches to `mqtts://` with server validation.
-- Credentials: per‑device user/password supported.
-- Safety: Apply/Restart are press‑only and rate‑limited.
+- Credentials: per‑device user/password supported. Command entities are enabled only when `MQTT_USERNAME` is set, unless `MQTT_ALLOW_ANONYMOUS_COMMANDS` is explicitly set to `1`.
+- Safety: Apply/Restart are press‑only and rate‑limited. Use broker ACLs so each device/user can publish only to the intended `presence/<device-id>/cmd/...` topics.
 
 ## Files
 

@@ -207,38 +207,78 @@ static esp_err_t read_response(ld2420_t* sensor, uint8_t *rx, size_t rx_size, in
         return ESP_ERR_INVALID_ARG;
     }
 
-    size_t total = 0;
+    size_t have = 0;
     TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms > 0 ? timeout_ms : 0);
+    bool wait_forever = timeout_ms <= 0;
 
     while (true) {
-        if (total >= rx_size) {
+        if (have >= rx_size) {
             return ESP_ERR_INVALID_SIZE;
         }
-        int chunk = uart_read_bytes(sensor->uart_port, rx + total, rx_size - total, pdMS_TO_TICKS(20));
+
+        int chunk = uart_read_bytes(sensor->uart_port, rx + have, rx_size - have, pdMS_TO_TICKS(20));
         if (chunk > 0) {
-            total += (size_t)chunk;
-            if (total >= 6) {
-                uint16_t payload_len = (uint16_t)(rx[4] | (rx[5] << 8));
-                size_t frame_len = 4 + 2 + (size_t)payload_len + 4;
-                if (frame_len > rx_size) {
-                    return ESP_ERR_INVALID_SIZE;
-                }
-                if (total >= frame_len) {
-                    if (out_len) {
-                        *out_len = frame_len;
-                    }
-                    return ESP_OK;
-                }
-            }
-        } else {
-            if (timeout_ms <= 0) {
-                continue;
-            }
+            have += (size_t)chunk;
+        } else if (!wait_forever) {
             TickType_t now = xTaskGetTickCount();
             if ((int32_t)(deadline - now) <= 0) {
                 return ESP_ERR_TIMEOUT;
             }
         }
+
+        size_t header_idx = have;
+        for (size_t i = 0; i + 4 <= have; ++i) {
+            if (rx[i] == RESPONSE_HEADER0 && rx[i + 1] == RESPONSE_HEADER1 &&
+                rx[i + 2] == RESPONSE_HEADER2 && rx[i + 3] == RESPONSE_HEADER3) {
+                header_idx = i;
+                break;
+            }
+        }
+
+        if (header_idx == have) {
+            if (have > 4) {
+                size_t keep = 4;
+                memmove(rx, rx + have - keep, keep);
+                have = keep;
+            }
+            continue;
+        }
+
+        if (header_idx > 0) {
+            memmove(rx, rx + header_idx, have - header_idx);
+            have -= header_idx;
+        }
+
+        if (have < 6) {
+            continue;
+        }
+
+        uint16_t payload_len = (uint16_t)(rx[4] | (rx[5] << 8));
+        size_t frame_len = 4 + 2 + (size_t)payload_len + 4;
+        if (frame_len > rx_size) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+
+        if (have < frame_len) {
+            continue;
+        }
+
+        size_t footer_idx = frame_len - 4;
+        if (rx[footer_idx] != RESPONSE_FOOTER0 || rx[footer_idx + 1] != RESPONSE_FOOTER1 ||
+            rx[footer_idx + 2] != RESPONSE_FOOTER2 || rx[footer_idx + 3] != RESPONSE_FOOTER3) {
+            if (have > 1) {
+                memmove(rx, rx + 1, have - 1);
+                have -= 1;
+            } else {
+                have = 0;
+            }
+            continue;
+        }
+
+        if (out_len) {
+            *out_len = frame_len;
+        }
+        return ESP_OK;
     }
 }
 
@@ -924,15 +964,22 @@ void ld2420_update(ld2420_t* sensor) {
 }
 
 bool ld2420_is_detecting(ld2420_t* sensor) {
-    if (sensor == NULL) return false;
-    return sensor->current_data.state == LD2420_DETECTION_ACTIVE;
+    ld2420_data_t data = ld2420_get_current_data(sensor);
+    return data.state == LD2420_DETECTION_ACTIVE;
 }
 
 ld2420_data_t ld2420_get_current_data(ld2420_t* sensor) {
-    if (sensor != NULL) {
-        return sensor->current_data;
+    if (sensor == NULL) {
+        return (ld2420_data_t){0};
     }
-    return (ld2420_data_t){0};
+
+    if (!uart_lock_take(sensor, portMAX_DELAY)) {
+        return (ld2420_data_t){0};
+    }
+
+    ld2420_data_t data = sensor->current_data;
+    uart_lock_give(sensor);
+    return data;
 }
 
 // Register callbacks

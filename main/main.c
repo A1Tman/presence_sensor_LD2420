@@ -18,7 +18,7 @@
 #include "oled_status.h"
 #include "../config/secrets.h"
 
-#define DEVICE_VERSION "1.4.0"
+#define DEVICE_VERSION "1.5.0"
 
 // ==================== CONSTANTS ====================
 #define DIST_MIN_VALID_CM          10
@@ -33,6 +33,13 @@
 #define DELAY_MAX_MS               65535
 #define DETECT_LOG_DELTA_CM        5
 #define LOOP_STATUS_INTERVAL_ITERS 100   // ~10s at 100ms loop delay
+#define RAW_PRESENCE_STALE_US      (2LL * 1000000LL)
+#define APPLY_CONFIG_TASK_STACK    4096
+#define APPLY_CONFIG_TASK_PRIO     5
+
+#ifndef MQTT_ALLOW_ANONYMOUS_COMMANDS
+#define MQTT_ALLOW_ANONYMOUS_COMMANDS 0
+#endif
 
 // Pin configuration
 #define UART_PORT UART_NUM_1
@@ -47,6 +54,7 @@ static const char *TAG = "LD2420_PRESENCE";
 static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num = 0;
 static SemaphoreHandle_t s_state_mutex = NULL;
+static TaskHandle_t s_apply_config_task_handle = NULL;
 
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
@@ -57,7 +65,9 @@ static int s_presence_timeout_sec = 30;     // Hold presence after movement
 static int s_distance_history[3] = {-1, -1, -1};
 static int s_history_idx = 0;
 static bool s_current_presence = false;
-static int64_t s_last_movement_time = 0;
+static int64_t s_last_presence_time = -1;
+static int64_t s_last_raw_presence_time = -1;
+static bool s_raw_presence_active = false;
 static int s_last_distance = -1;
 static ld2420_t* s_sensor = NULL;
 static bool s_sensor_ready = false;
@@ -94,18 +104,28 @@ static void update_presence_state(bool raw_present, int distance_cm) {
     bool movement = false;
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_raw_presence_active = raw_present;
+    if (raw_present) {
+        s_last_raw_presence_time = now;
+        s_last_presence_time = now;
+    }
+
     if (valid_distance) {
         movement = detect_movement(distance_cm);
         if (movement) {
-            s_last_movement_time = now;
+            s_last_presence_time = now;
             ESP_LOGI(TAG, "Movement detected at %d cm", distance_cm);
         }
     }
 
     // Occupancy stays on while the radar reports presence and can still be
     // extended briefly after movement if packets go idle or become noisy.
-    int64_t time_since_movement = (now - s_last_movement_time) / 1000000LL;
-    bool presence = (raw_present || movement || time_since_movement < s_presence_timeout_sec);
+    bool hold_active = false;
+    if (s_last_presence_time >= 0) {
+        int64_t time_since_presence = (now - s_last_presence_time) / 1000000LL;
+        hold_active = time_since_presence < s_presence_timeout_sec;
+    }
+    bool presence = (raw_present || movement || hold_active);
 
     bool should_publish = false;
     int publish_distance_mm = (s_last_distance >= 0) ? s_last_distance * 10 : -1;
@@ -354,10 +374,31 @@ static void apply_ld_config(void) {
     }
 }
 
+static void apply_ld_config_task(void *arg) {
+    (void)arg;
+
+    while (1) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        apply_ld_config();
+    }
+}
+
+static void request_apply_ld_config(void) {
+    if (s_apply_config_task_handle == NULL) {
+        ESP_LOGW(TAG, "Apply config requested before worker task is ready");
+        return;
+    }
+
+    xTaskNotifyGive(s_apply_config_task_handle);
+}
+
 static void collect_oled_snapshot(oled_status_snapshot_t *out_snapshot) {
     if (out_snapshot == NULL || s_state_mutex == NULL) {
         return;
     }
+
+    ld2420_t *sensor = s_sensor;
+    ld2420_data_t sensor_data = sensor ? ld2420_get_current_data(sensor) : (ld2420_data_t){0};
 
     memset(out_snapshot, 0, sizeof(*out_snapshot));
     out_snapshot->distance_cm = -1;
@@ -365,7 +406,7 @@ static void collect_oled_snapshot(oled_status_snapshot_t *out_snapshot) {
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     out_snapshot->sensor_ready = s_sensor_ready;
-    out_snapshot->sensor_packets_valid = (s_sensor != NULL) && s_sensor->current_data.isValid;
+    out_snapshot->sensor_packets_valid = sensor_data.isValid;
     out_snapshot->presence = s_current_presence;
     out_snapshot->wifi_connected = s_wifi_connected;
     out_snapshot->ip_last_octet = s_ip_last_octet;
@@ -408,6 +449,14 @@ static void start_mqtt(void) {
     const char *scheme = (ca_pem != NULL) ? "mqtts" : "mqtt";
     snprintf(uri, sizeof(uri), "%s://%s:%d", scheme, MQTT_BROKER_HOST, MQTT_BROKER_PORT);
 
+    bool mqtt_credentials_configured = (MQTT_USERNAME[0] != '\0');
+    bool command_topics_enabled = mqtt_credentials_configured || MQTT_ALLOW_ANONYMOUS_COMMANDS;
+    if (!command_topics_enabled) {
+        ESP_LOGW(TAG, "MQTT command topics disabled: configure MQTT_USERNAME or set MQTT_ALLOW_ANONYMOUS_COMMANDS=1");
+    } else if (ca_pem == NULL) {
+        ESP_LOGW(TAG, "MQTT command topics enabled without TLS; rely on trusted LAN and broker ACLs");
+    }
+
     ha_mqtt_cfg_t cfg = {
         .broker_uri = uri,
         .username = MQTT_USERNAME[0] ? MQTT_USERNAME : NULL,
@@ -415,8 +464,10 @@ static void start_mqtt(void) {
         .friendly_name = DEVICE_NAME,
         .suggested_area = DEVICE_LOCATION,
         .app_version = DEVICE_VERSION,
+        .discovery_prefix = HA_DISCOVERY_PREFIX,
         .distance_supported = true,
         .broker_ca_cert_pem = ca_pem,
+        .command_topics_enabled = command_topics_enabled,
         .get_distance_thresh_cm = get_movement_threshold,
         .set_distance_thresh_cm = set_movement_threshold,
         .get_hold_on_ms = get_presence_timeout_ms,
@@ -432,7 +483,7 @@ static void start_mqtt(void) {
         .set_ld_trigger_sens = set_ld_trigger_sens,
         .get_ld_maintain_sens = get_ld_maintain_sens,
         .set_ld_maintain_sens = set_ld_maintain_sens,
-        .action_apply_config = apply_ld_config,
+        .action_apply_config = request_apply_ld_config,
     };
 
     ha_mqtt_init(&cfg);
@@ -565,7 +616,7 @@ void app_main(void) {
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     s_sensor_ready = true;
     xSemaphoreGive(s_state_mutex);
-    ESP_LOGI(TAG, "✓ Sensor initialized successfully");
+    ESP_LOGI(TAG, "Sensor initialized successfully");
     sync_ld_config_from_sensor();
 
     // Read firmware version and publish (diagnostic)
@@ -576,7 +627,7 @@ void app_main(void) {
             snprintf(s_ld_fw_version, sizeof(s_ld_fw_version), "%.15s", fw);
             xSemaphoreGive(s_state_mutex);
             ESP_LOGI(TAG, "LD2420 FW: %s", fw);
-            ha_mqtt_publish_fw_version(fw);
+            ha_mqtt_publish_ld2420_fw_version(fw);
         } else {
             xSemaphoreTake(s_state_mutex, portMAX_DELAY);
             snprintf(s_ld_fw_version, sizeof(s_ld_fw_version), "%s", "?");
@@ -589,8 +640,16 @@ void app_main(void) {
     ld2420_on_detection(s_sensor, onDetection);
     ld2420_on_state_change(s_sensor, onStateChange);
     ld2420_on_data_update(s_sensor, onDataUpdate);
+
+    if (xTaskCreate(apply_ld_config_task, "ld_apply_cfg",
+                    APPLY_CONFIG_TASK_STACK, NULL,
+                    APPLY_CONFIG_TASK_PRIO,
+                    &s_apply_config_task_handle) != pdPASS) {
+        ESP_LOGW(TAG, "Failed to create LD2420 apply-config worker");
+        s_apply_config_task_handle = NULL;
+    }
     
-    ESP_LOGI(TAG, "✓ Callbacks registered");
+    ESP_LOGI(TAG, "Callbacks registered");
     ESP_LOGI(TAG, "-------------------------------------");
     ESP_LOGI(TAG, "Expected Energy Mode packet format:");
     ESP_LOGI(TAG, "  Header: F4 F3 F2 F1");
@@ -630,14 +689,20 @@ void app_main(void) {
         static int loop_counter = 0;
         if (++loop_counter >= LOOP_STATUS_INTERVAL_ITERS) {  // Every ~10 seconds
             loop_counter = 0;
-            
-            if (s_sensor && s_sensor->current_data.isValid) {
+
+            ld2420_data_t sensor_data = ld2420_get_current_data(s_sensor);
+            bool presence_snapshot = false;
+            xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+            presence_snapshot = s_current_presence;
+            xSemaphoreGive(s_state_mutex);
+
+            if (sensor_data.isValid) {
                 // We're getting valid packets
                 ESP_LOGD(TAG, "Status: %s | Distance: %d cm | OT2: %s | MQTT Presence: %s",
-                         s_sensor->current_data.state == LD2420_DETECTION_ACTIVE ? "DETECTING" : "IDLE",
-                         s_sensor->current_data.distance,
+                         sensor_data.state == LD2420_DETECTION_ACTIVE ? "DETECTING" : "IDLE",
+                         sensor_data.distance,
                          ot2_state ? "HIGH" : "LOW",
-                         s_current_presence ? "ON" : "OFF");
+                         presence_snapshot ? "ON" : "OFF");
                 no_packet_counter = 0;
             } else {
                 // No valid packets yet
@@ -661,8 +726,13 @@ void app_main(void) {
         int last_distance_local = -1;
         xSemaphoreTake(s_state_mutex, portMAX_DELAY);
         if (s_current_presence) {
-            int64_t elapsed = (now - s_last_movement_time) / 1000000LL;
-            if (elapsed >= s_presence_timeout_sec) {
+            bool raw_presence_recent = s_raw_presence_active &&
+                                       s_last_raw_presence_time >= 0 &&
+                                       (now - s_last_raw_presence_time) <= RAW_PRESENCE_STALE_US;
+            int64_t elapsed = (s_last_presence_time >= 0)
+                                  ? (now - s_last_presence_time) / 1000000LL
+                                  : INT64_MAX;
+            if (!raw_presence_recent && elapsed >= s_presence_timeout_sec) {
                 s_current_presence = false;
                 last_distance_local = s_last_distance;
                 do_clear = true;
