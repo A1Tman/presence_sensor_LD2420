@@ -27,7 +27,7 @@ static ha_mqtt_cfg_t s_cfg = {
     .password      = NULL,
     .friendly_name = "Radar Sensor",
     .suggested_area= NULL,
-    .app_version   = "1.5.0",
+    .app_version   = "2.0.0",
     .distance_supported = true,
     .broker_ca_cert_pem = NULL,
 };
@@ -230,10 +230,8 @@ static bool safe_atoi(const char *str, int len, int *out_val, int min, int max) 
     long val = strtol(start, &endptr, 10);
     
     if (*endptr != '\0') return false;
-    if (val < min || val > max) {
-        val = (val < min) ? min : max;
-    }
-    
+    if (val < min || val > max) return false;
+
     *out_val = (int)val;
     return true;
 }
@@ -1018,6 +1016,9 @@ static void publish_attrs_once(void) {
 /* ======================= MQTT event handling ======================= */
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
+    (void)handler_args;
+    (void)base;
+
     esp_mqtt_event_handle_t e = (esp_mqtt_event_handle_t)event_data;
 
     switch (event_id) {
@@ -1259,15 +1260,24 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 }
                 
                 /* Handle smoothing window command */
-                if (tlen == (int)strlen(s_topic_cfg_smooth_cmd) && 
+                if (tlen == (int)strlen(s_topic_cfg_smooth_cmd) &&
                     strncmp(t, s_topic_cfg_smooth_cmd, tlen) == 0) {
                     int v;
                     if (safe_atoi(payload, payload_len, &v, 1, 10)) {
+                        bool lock_taken = false;
+                        if (s_publish_lock) {
+                            lock_taken = xSemaphoreTake(s_publish_lock, portMAX_DELAY) == pdTRUE;
+                        }
                         s_smooth_win = v;
-                        char buf[16]; 
-                        snprintf(buf, sizeof(buf), "%d", v); 
+                        if (lock_taken) {
+                            xSemaphoreGive(s_publish_lock);
+                        }
+                        char buf[16];
+                        snprintf(buf, sizeof(buf), "%d", v);
                         pub(s_topic_cfg_smooth_stat, buf, 1, 1);
                         ESP_LOGI(TAG, "Set smoothing window: %d", v);
+                    } else {
+                        ESP_LOGW(TAG, "Invalid smoothing window value");
                     }
                 }
 

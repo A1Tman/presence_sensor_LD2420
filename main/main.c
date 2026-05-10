@@ -18,7 +18,7 @@
 #include "oled_status.h"
 #include "../config/secrets.h"
 
-#define DEVICE_VERSION "1.5.0"
+#define DEVICE_VERSION "2.0.0"
 
 // ==================== CONSTANTS ====================
 #define DIST_MIN_VALID_CM          10
@@ -34,6 +34,7 @@
 #define DETECT_LOG_DELTA_CM        5
 #define LOOP_STATUS_INTERVAL_ITERS 100   // ~10s at 100ms loop delay
 #define RAW_PRESENCE_STALE_US      (2LL * 1000000LL)
+#define MOVEMENT_LOG_INTERVAL_US   (2LL * 1000000LL)
 #define APPLY_CONFIG_TASK_STACK    4096
 #define APPLY_CONFIG_TASK_PRIO     5
 
@@ -67,6 +68,7 @@ static int s_history_idx = 0;
 static bool s_current_presence = false;
 static int64_t s_last_presence_time = -1;
 static int64_t s_last_raw_presence_time = -1;
+static int64_t s_last_movement_log_time = -1;
 static bool s_raw_presence_active = false;
 static int s_last_distance = -1;
 static ld2420_t* s_sensor = NULL;
@@ -114,7 +116,11 @@ static void update_presence_state(bool raw_present, int distance_cm) {
         movement = detect_movement(distance_cm);
         if (movement) {
             s_last_presence_time = now;
-            ESP_LOGI(TAG, "Movement detected at %d cm", distance_cm);
+            if (s_last_movement_log_time < 0 ||
+                (now - s_last_movement_log_time) >= MOVEMENT_LOG_INTERVAL_US) {
+                s_last_movement_log_time = now;
+                ESP_LOGI(TAG, "Movement detected at %d cm", distance_cm);
+            }
         }
     }
 
@@ -547,6 +553,10 @@ static esp_err_t wifi_init(void) {
         .sta = {
             .ssid = WIFI_SSID,
             .password = WIFI_PASSWORD,
+            // Reject APs weaker than WPA2-PSK so an evil-twin open/WEP/WPA1
+            // AP advertising the same SSID cannot lure the device off-network.
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            .pmf_cfg = { .capable = true, .required = false },
         },
     };
 
