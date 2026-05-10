@@ -19,7 +19,7 @@
 #include "oled_status.h"
 #include "../config/secrets.h"
 
-#define DEVICE_VERSION "2.1.0"
+#define DEVICE_VERSION "2.2.0"
 
 // ==================== CONSTANTS ====================
 #define DIST_MIN_VALID_CM          10
@@ -41,6 +41,15 @@
 
 #ifndef MQTT_ALLOW_ANONYMOUS_COMMANDS
 #define MQTT_ALLOW_ANONYMOUS_COMMANDS 0
+#endif
+
+// Allow MQTT command topics when the broker is plaintext (no CA configured).
+// Default is 0: commands require TLS so a misconfigured deployment cannot
+// expose restart / apply-config to broker-side ACL bypasses or LAN sniffers.
+// Set to 1 in secrets.h only if you have a hardened LAN where broker ACLs
+// + plaintext are an explicit choice.
+#ifndef MQTT_ALLOW_INSECURE_COMMANDS
+#define MQTT_ALLOW_INSECURE_COMMANDS 0
 #endif
 
 // NVS keys for app-level tunables that should survive reboots. The LD2420
@@ -514,11 +523,17 @@ static void start_mqtt(void) {
     snprintf(uri, sizeof(uri), "%s://%s:%d", scheme, MQTT_BROKER_HOST, MQTT_BROKER_PORT);
 
     bool mqtt_credentials_configured = (MQTT_USERNAME[0] != '\0');
-    bool command_topics_enabled = mqtt_credentials_configured || MQTT_ALLOW_ANONYMOUS_COMMANDS;
-    if (!command_topics_enabled) {
+    bool tls_enabled = (ca_pem != NULL);
+    bool auth_ok = mqtt_credentials_configured || MQTT_ALLOW_ANONYMOUS_COMMANDS;
+    bool transport_ok = tls_enabled || MQTT_ALLOW_INSECURE_COMMANDS;
+    bool command_topics_enabled = auth_ok && transport_ok;
+
+    if (!auth_ok) {
         ESP_LOGW(TAG, "MQTT command topics disabled: configure MQTT_USERNAME or set MQTT_ALLOW_ANONYMOUS_COMMANDS=1");
-    } else if (ca_pem == NULL) {
-        ESP_LOGW(TAG, "MQTT command topics enabled without TLS; rely on trusted LAN and broker ACLs");
+    } else if (!transport_ok) {
+        ESP_LOGW(TAG, "MQTT command topics disabled: TLS required (define MQTT_BROKER_CA_CERT_PEM, or set MQTT_ALLOW_INSECURE_COMMANDS=1 to opt in to plaintext)");
+    } else if (!tls_enabled) {
+        ESP_LOGW(TAG, "MQTT command topics enabled over plaintext via MQTT_ALLOW_INSECURE_COMMANDS; rely on trusted LAN and broker ACLs");
     }
 
     ha_mqtt_cfg_t cfg = {

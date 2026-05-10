@@ -27,7 +27,7 @@ static ha_mqtt_cfg_t s_cfg = {
     .password      = NULL,
     .friendly_name = "Radar Sensor",
     .suggested_area= NULL,
-    .app_version   = "2.1.0",
+    .app_version   = "2.2.0",
     .distance_supported = true,
     .broker_ca_cert_pem = NULL,
 };
@@ -193,17 +193,29 @@ static bool json_appendf(char *payload, size_t payload_size, int *len, const cha
 
     if (written < 0) {
         payload[used] = '\0';
+        *len = -1;  // sentinel: subsequent json_appendf calls short-circuit
         return false;
     }
 
     if ((size_t)written >= payload_size - used) {
         payload[payload_size - 1] = '\0';
-        *len = (int)(payload_size - 1);
+        *len = -1;  // sentinel: builder is now truncated
         return false;
     }
 
     *len += written;
     return true;
+}
+
+// Publish a discovery payload only if it was built without truncation.
+// Pair with json_appendf's -1 sentinel: if any append in the chain overflowed,
+// len < 0 here and we skip the pub instead of shipping malformed JSON to HA.
+static void try_pub_disc(const char *topic, const char *payload, int len) {
+    if (len < 0) {
+        ESP_LOGW(TAG, "Discovery payload truncated, skipping %s", topic);
+        return;
+    }
+    pub(topic, payload, 1, 1);
 }
 
 static void append_default_entity_id(char *payload, size_t payload_size, int *len,
@@ -636,7 +648,7 @@ static void publish_discovery_all(void) {
         append_default_entity_id(payload, sizeof(payload), &len, "binary_sensor", "presence");
         json_appendf(payload, sizeof(payload), &len, "%s", dev_block);
         json_appendf(payload, sizeof(payload), &len, "}");
-        pub(s_disc_bs_presence, payload, 1, 1);
+        try_pub_disc(s_disc_bs_presence, payload, len);
     }
 
     /* Distance (sensor) - only if supported */
@@ -657,7 +669,7 @@ static void publish_discovery_all(void) {
         append_default_entity_id(payload, sizeof(payload), &len, "sensor", "distance");
         json_appendf(payload, sizeof(payload), &len, "%s", dev_block);
         json_appendf(payload, sizeof(payload), &len, "}");
-        pub(s_disc_sensor_movement, payload, 1, 1);
+        try_pub_disc(s_disc_sensor_movement, payload, len);
     }
 
     /* Signal (sensor) - diagnostic */
@@ -677,7 +689,7 @@ static void publish_discovery_all(void) {
         append_default_entity_id(payload, sizeof(payload), &len, "sensor", "signal");
         json_appendf(payload, sizeof(payload), &len, "%s", dev_block);
         json_appendf(payload, sizeof(payload), &len, "}");
-        pub(s_disc_sensor_rssi, payload, 1, 1);
+        try_pub_disc(s_disc_sensor_rssi, payload, len);
     }
 
     /* Uptime (sensor) - diagnostic */
@@ -697,7 +709,7 @@ static void publish_discovery_all(void) {
         append_default_entity_id(payload, sizeof(payload), &len, "sensor", "uptime");
         json_appendf(payload, sizeof(payload), &len, "%s", dev_block);
         json_appendf(payload, sizeof(payload), &len, "}");
-        pub(s_disc_sensor_uptime, payload, 1, 1);
+        try_pub_disc(s_disc_sensor_uptime, payload, len);
     }
 
     /* LD2420 Firmware Version (sensor) - diagnostic */
@@ -715,7 +727,7 @@ static void publish_discovery_all(void) {
         append_default_entity_id(payload, sizeof(payload), &len, "sensor", "ld_fw");
         json_appendf(payload, sizeof(payload), &len, "%s", dev_block);
         json_appendf(payload, sizeof(payload), &len, "}");
-        pub(s_disc_sensor_fwver, payload, 1, 1);
+        try_pub_disc(s_disc_sensor_fwver, payload, len);
     }
 
     /* Movement Threshold config (number) */
@@ -727,7 +739,7 @@ static void publish_discovery_all(void) {
         json_appendf(payload, sizeof(payload), &len, "%s", dev_block);
         json_appendf(payload, sizeof(payload), &len, "}");
         char disc[192]; snprintf(disc, sizeof(disc), "%s/number/%s/movement_thresh/config", s_disc_prefix, s_devid);
-        pub(disc, payload, 1, 1);
+        try_pub_disc(disc, payload, len);
     }
 
     /* Hold Time config (number) */
@@ -739,7 +751,7 @@ static void publish_discovery_all(void) {
         json_appendf(payload, sizeof(payload), &len, "%s", dev_block);
         json_appendf(payload, sizeof(payload), &len, "}");
         char disc[192]; snprintf(disc, sizeof(disc), "%s/number/%s/presence_timeout/config", s_disc_prefix, s_devid);
-        pub(disc, payload, 1, 1);
+        try_pub_disc(disc, payload, len);
     }
 
     /* Min Range (LD2420) */
@@ -751,7 +763,7 @@ static void publish_discovery_all(void) {
         json_appendf(payload, sizeof(payload), &len, "%s", dev_block);
         json_appendf(payload, sizeof(payload), &len, "}");
         char disc[192]; snprintf(disc, sizeof(disc), "%s/number/%s/ld_min_gate/config", s_disc_prefix, s_devid);
-        pub(disc, payload, 1, 1);
+        try_pub_disc(disc, payload, len);
     }
     
     /* Max Range (LD2420) */
@@ -763,7 +775,7 @@ static void publish_discovery_all(void) {
         json_appendf(payload, sizeof(payload), &len, "%s", dev_block);
         json_appendf(payload, sizeof(payload), &len, "}");
         char disc[192]; snprintf(disc, sizeof(disc), "%s/number/%s/ld_max_gate/config", s_disc_prefix, s_devid);
-        pub(disc, payload, 1, 1);
+        try_pub_disc(disc, payload, len);
     }
     
     /* Response Delay (LD2420) */
@@ -775,7 +787,7 @@ static void publish_discovery_all(void) {
         json_appendf(payload, sizeof(payload), &len, "%s", dev_block);
         json_appendf(payload, sizeof(payload), &len, "}");
         char disc[192]; snprintf(disc, sizeof(disc), "%s/number/%s/ld_delay/config", s_disc_prefix, s_devid);
-        pub(disc, payload, 1, 1);
+        try_pub_disc(disc, payload, len);
     }
     
     /* Trigger Level (LD2420) */
@@ -787,7 +799,7 @@ static void publish_discovery_all(void) {
         json_appendf(payload, sizeof(payload), &len, "%s", dev_block);
         json_appendf(payload, sizeof(payload), &len, "}");
         char disc[192]; snprintf(disc, sizeof(disc), "%s/number/%s/ld_trig_sens/config", s_disc_prefix, s_devid);
-        pub(disc, payload, 1, 1);
+        try_pub_disc(disc, payload, len);
     }
     
     /* Tracking Level (LD2420) */
@@ -799,7 +811,7 @@ static void publish_discovery_all(void) {
         json_appendf(payload, sizeof(payload), &len, "%s", dev_block);
         json_appendf(payload, sizeof(payload), &len, "}");
         char disc[192]; snprintf(disc, sizeof(disc), "%s/number/%s/ld_maint_sens/config", s_disc_prefix, s_devid);
-        pub(disc, payload, 1, 1);
+        try_pub_disc(disc, payload, len);
     }
 
     /* Movement zone binary_sensors */
@@ -815,7 +827,7 @@ static void publish_discovery_all(void) {
         json_appendf(payload, sizeof(payload), &len, "%s", dev_block);
         json_appendf(payload, sizeof(payload), &len, "}");
         char disc[192]; snprintf(disc, sizeof(disc), "%s/binary_sensor/%s/movement_%d/config", s_disc_prefix, s_devid, i+1);
-        pub(disc, payload, 1, 1);
+        try_pub_disc(disc, payload, len);
     }
 
     if (command_topics_enabled) {
@@ -832,7 +844,7 @@ static void publish_discovery_all(void) {
                 json_appendf(payload, sizeof(payload), &len, "%s", dev_block);
                 json_appendf(payload, sizeof(payload), &len, "}");
                 char disc[192]; snprintf(disc, sizeof(disc), "%s/number/%s/%s_min/config", s_disc_prefix, s_devid, zone_names_lower[i]);
-                pub(disc, payload, 1, 1);
+                try_pub_disc(disc, payload, len);
             }
             // End Distance
             {
@@ -843,7 +855,7 @@ static void publish_discovery_all(void) {
                 json_appendf(payload, sizeof(payload), &len, "%s", dev_block);
                 json_appendf(payload, sizeof(payload), &len, "}");
                 char disc[192]; snprintf(disc, sizeof(disc), "%s/number/%s/%s_max/config", s_disc_prefix, s_devid, zone_names_lower[i]);
-                pub(disc, payload, 1, 1);
+                try_pub_disc(disc, payload, len);
             }
         }
 
@@ -856,7 +868,7 @@ static void publish_discovery_all(void) {
             json_appendf(payload, sizeof(payload), &len, "%s", dev_block);
             json_appendf(payload, sizeof(payload), &len, "}");
             char disc[192]; snprintf(disc, sizeof(disc), "%s/number/%s/distance_smoothing/config", s_disc_prefix, s_devid);
-            pub(disc, payload, 1, 1);
+            try_pub_disc(disc, payload, len);
         }
 
         /* Action buttons */
@@ -879,7 +891,7 @@ static void publish_discovery_all(void) {
                 s_devid, s_topic_cmd_restart);
             json_appendf(payload, sizeof(payload), &len, "%s", dev_block);
             json_appendf(payload, sizeof(payload), &len, "}");
-            pub(s_disc_button_restart, payload, 1, 1);
+            try_pub_disc(s_disc_button_restart, payload, len);
         }
         {
             char payload[1024]; int len=0;
@@ -888,7 +900,7 @@ static void publish_discovery_all(void) {
                 s_devid, s_topic_cmd_resend_disc);
             json_appendf(payload, sizeof(payload), &len, "%s", dev_block);
             json_appendf(payload, sizeof(payload), &len, "}");
-            pub(s_disc_button_resend_disc, payload, 1, 1);
+            try_pub_disc(s_disc_button_resend_disc, payload, len);
         }
         {
             char payload[1024]; int len=0;
@@ -897,7 +909,7 @@ static void publish_discovery_all(void) {
                 s_devid, s_topic_cmd_apply_cfg);
             json_appendf(payload, sizeof(payload), &len, "%s", dev_block);
             json_appendf(payload, sizeof(payload), &len, "}");
-            pub(s_disc_button_apply_cfg, payload, 1, 1);
+            try_pub_disc(s_disc_button_apply_cfg, payload, len);
         }
     } else {
         clear_command_discovery_configs();

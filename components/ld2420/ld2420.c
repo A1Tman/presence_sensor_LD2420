@@ -914,8 +914,11 @@ static void parse_byte(ld2420_t* sensor, uint8_t byte) {
                 sensor->packet_length |= (byte << 8);
                 sensor->parse_state = 2;
                 sensor->data_index = 0;
-                // Validate length (Energy mode typically sends 35 bytes)
-                if (sensor->packet_length > 64 || sensor->packet_length < 3) {
+                // Energy mode packets always carry exactly PACKET_DATA_SIZE
+                // (35) bytes. Anything else is corruption or a UART tamper
+                // attempt; reject so a 3-byte fragment cannot be treated as
+                // a valid presence/distance reading.
+                if (sensor->packet_length != PACKET_DATA_SIZE) {
                     ESP_LOGW(TAG, "Invalid packet length %d, resetting", sensor->packet_length);
                     sensor->parse_state = 0;
                     sensor->header_index = 0;
@@ -996,16 +999,18 @@ ld2420_data_t ld2420_get_current_data(ld2420_t* sensor) {
         return (ld2420_data_t){0};
     }
 
-    // Short timeout: if a writer holds data_lock briefly we'll wait for it,
+    // Short timeout: if a writer holds data_lock briefly we wait for it,
     // but we never block on the heavy uart_lock the apply-config worker
-    // takes. Returns the last published snapshot, not zeroed data, so the
-    // OLED keeps rendering through long UART operations.
-    ld2420_data_t data = sensor->current_data;
+    // takes. On success we refresh last_snapshot, which is mutated only
+    // here (never by the parser), so the timeout fallback reads a struct
+    // that no other task is writing -- no torn reads of current_data.
     if (xSemaphoreTake(sensor->data_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
-        data = sensor->current_data;
+        sensor->last_snapshot = sensor->current_data;
+        ld2420_data_t data = sensor->last_snapshot;
         xSemaphoreGive(sensor->data_lock);
+        return data;
     }
-    return data;
+    return sensor->last_snapshot;
 }
 
 // Register callbacks

@@ -39,7 +39,12 @@ typedef void (*ld2420_data_cb)(ld2420_data_t data);
 // Main sensor instance structure
 struct ld2420_t {
     uart_port_t uart_port;
-    ld2420_data_t current_data;
+    ld2420_data_t current_data;   // Mutated by parse_energy_packet under data_lock.
+    ld2420_data_t last_snapshot;  // Mirror of current_data refreshed only on the
+                                  // lock-success path of ld2420_get_current_data.
+                                  // Returned (unlocked) on the rare data_lock
+                                  // timeout so callers never observe a partial
+                                  // current_data write from the parser.
     SemaphoreHandle_t uart_lock;  // Recursive mutex - allows nested locking by same task
     SemaphoreHandle_t data_lock;  // Lightweight mutex guarding current_data reads/writes;
                                   // independent of uart_lock so snapshot readers (OLED,

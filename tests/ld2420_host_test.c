@@ -250,6 +250,9 @@ static void test_get_current_data_timeout_returns_last_snapshot(void) {
         .timestamp = 456,
         .isValid = true,
     };
+    ld2420_data_t seeded = ld2420_get_current_data(&sensor);
+    assert(seeded.state == LD2420_DETECTION_ACTIVE);
+    assert(seeded.distance == 123);
     g_fail_next_mutex_take = 1;
     ld2420_data_t data = ld2420_get_current_data(&sensor);
     assert(data.state == LD2420_DETECTION_ACTIVE);
