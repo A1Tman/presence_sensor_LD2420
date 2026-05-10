@@ -16,7 +16,8 @@
 
 - [x] Keep ESP application firmware and LD2420 module firmware explicitly separate in MQTT naming.
 - [x] Wire `HA_DISCOVERY_PREFIX` from `config/secrets.h` into `ha_mqtt_cfg_t`.
-- [ ] Add focused tests for presence state, MQTT payload assembly, zone normalization, and LD2420 frame parsing.
+- [x] Add host tests for MQTT discovery, command gating, reconnect republish, and LD2420 frame parsing.
+- [ ] Add focused tests for main presence state transitions and zone normalization edge cases.
 
 ## Review Workflow
 

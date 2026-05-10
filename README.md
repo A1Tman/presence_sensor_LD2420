@@ -25,6 +25,14 @@ idf.py set-target esp32c3
 idf.py build flash monitor
 ```
 
+## Tests
+
+Fast host-side harness tests cover MQTT discovery/command behavior and LD2420 command-frame parsing:
+
+```
+powershell -ExecutionPolicy Bypass -File tests\run_host_tests.ps1
+```
+
 ## Home Assistant
 
 This firmware publishes HA discovery. After boot you’ll see a device with:
