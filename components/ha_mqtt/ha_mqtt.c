@@ -1018,14 +1018,22 @@ static void publish_attrs_once(void) {
         snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip.ip));
     }
     
+    // Caller-provided strings (device_model, app_version) need escaping so a
+    // friendly_name like `Foo "Bar"` cannot break the published JSON. mac,
+    // device_id, ip are computed from controlled inputs and are safe raw.
+    char model_esc[128];
+    char ver_esc[64];
+    json_escape(s_cfg.device_model ? s_cfg.device_model : "HLK-LD2420 + ESP32",
+                model_esc, sizeof(model_esc));
+    json_escape(s_cfg.app_version ? s_cfg.app_version : "1.0.0",
+                ver_esc, sizeof(ver_esc));
+
     int len = 0;
     json_appendf(json, sizeof(json), &len, "{");
     json_appendf(json, sizeof(json), &len, "\"mac\":\"%s\",", s_mac_str);
     json_appendf(json, sizeof(json), &len, "\"device_id\":\"%s\",", s_devid);
-    json_appendf(json, sizeof(json), &len, "\"model\":\"%s\",",
-                    s_cfg.device_model ? s_cfg.device_model : "HLK-LD2420 + ESP32");
-    json_appendf(json, sizeof(json), &len, "\"sw_version\":\"%s\",",
-                    s_cfg.app_version ? s_cfg.app_version : "1.0.0");
+    json_appendf(json, sizeof(json), &len, "\"model\":\"%s\",", model_esc);
+    json_appendf(json, sizeof(json), &len, "\"sw_version\":\"%s\",", ver_esc);
     json_appendf(json, sizeof(json), &len, "\"ip\":\"%s\"", ip_str);
     json_appendf(json, sizeof(json), &len, "}");
     pub(s_topic_attrs, json, 0, 0);

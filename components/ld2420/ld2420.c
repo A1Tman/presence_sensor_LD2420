@@ -982,7 +982,9 @@ void ld2420_update(ld2420_t* sensor) {
     
     static int update_counter = 0;
     if (++update_counter % 500 == 0) {  // Every 5 seconds
-        if (!sensor->current_data.isValid) {
+        // Read through the snapshot API so this diagnostic respects the same
+        // data_lock discipline as every other current_data consumer.
+        if (!ld2420_get_current_data(sensor).isValid) {
             ESP_LOGW(TAG, "No valid Energy packets yet. Check if sensor needs reconfiguration.");
         }
     }
