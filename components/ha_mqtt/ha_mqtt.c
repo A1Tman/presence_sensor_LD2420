@@ -27,7 +27,7 @@ static ha_mqtt_cfg_t s_cfg = {
     .password      = NULL,
     .friendly_name = "Radar Sensor",
     .suggested_area= NULL,
-    .app_version   = "2.0.0",
+    .app_version   = "2.1.0",
     .distance_supported = true,
     .broker_ca_cert_pem = NULL,
 };
@@ -221,10 +221,9 @@ static bool safe_atoi(const char *str, int len, int *out_val, int min, int max) 
     // Remove leading/trailing whitespace
     char *start = tmp;
     while (*start && isspace((unsigned char)*start)) start++;
+    if (*start == '\0') return false;
     char *end = start + strlen(start) - 1;
     while (end > start && isspace((unsigned char)*end)) *end-- = '\0';
-    
-    if (*start == '\0') return false;
     
     char *endptr;
     long val = strtol(start, &endptr, 10);
@@ -304,7 +303,10 @@ static bool mqtt_event_get_complete_payload(esp_mqtt_event_handle_t e,
     *topic_len = s_mqtt_rx.topic_len;
     *data = s_mqtt_rx.data;
     *data_len = s_mqtt_rx.expected_len;
-    mqtt_rx_reset();
+    // Caller's pointers reference s_mqtt_rx; do not memset it here. The next
+    // multi-fragment message resets via the offset==0 path; single-fragment
+    // messages do not touch s_mqtt_rx at all.
+    s_mqtt_rx.active = false;
     return true;
 }
 
@@ -579,7 +581,7 @@ static void clear_command_discovery_configs(void) {
 }
 
 static void publish_discovery_all(void) {
-    char dev_block[768];
+    char dev_block[1024];
     char area[96] = {0};
     char dev_name_esc[128];
     char dev_model_esc[128];
@@ -612,7 +614,7 @@ static void publish_discovery_all(void) {
 
     /* Presence (binary_sensor) */
     {
-        char payload[1024];
+        char payload[2048];
         int len = 0;
         json_appendf(payload, sizeof(payload), &len,
             "{"
@@ -635,7 +637,7 @@ static void publish_discovery_all(void) {
 
     /* Distance (sensor) - only if supported */
     if (s_cfg.distance_supported) {
-        char payload[1024];
+        char payload[2048];
         int len = 0;
         json_appendf(payload, sizeof(payload), &len,
             "{"
@@ -656,7 +658,7 @@ static void publish_discovery_all(void) {
 
     /* Signal (sensor) - diagnostic */
     {
-        char payload[1024];
+        char payload[2048];
         int len = 0;
         json_appendf(payload, sizeof(payload), &len,
             "{"
@@ -676,7 +678,7 @@ static void publish_discovery_all(void) {
 
     /* Uptime (sensor) - diagnostic */
     {
-        char payload[1024];
+        char payload[2048];
         int len = 0;
         json_appendf(payload, sizeof(payload), &len,
             "{"
@@ -696,7 +698,7 @@ static void publish_discovery_all(void) {
 
     /* LD2420 Firmware Version (sensor) - diagnostic */
     {
-        char payload[1024];
+        char payload[2048];
         int len = 0;
         json_appendf(payload, sizeof(payload), &len,
             "{"
@@ -714,7 +716,7 @@ static void publish_discovery_all(void) {
 
     /* Movement Threshold config (number) */
     if (command_topics_enabled && s_cfg.get_distance_thresh_cm && s_cfg.set_distance_thresh_cm) {
-        char payload[512]; int len=0;
+        char payload[1024]; int len=0;
         json_appendf(payload, sizeof(payload), &len,
             "{\"name\":\"Movement Threshold\",\"uniq_id\":\"%s_movement_thresh\",\"cmd_t\":\"%s\",\"stat_t\":\"%s\",\"min\":1,\"max\":50,\"step\":1,\"mode\":\"slider\",\"unit_of_meas\":\"cm\",\"ent_cat\":\"config\",",
             s_devid, s_topic_cfg_movement_thresh_cmd, s_topic_cfg_movement_thresh_stat);
@@ -726,7 +728,7 @@ static void publish_discovery_all(void) {
 
     /* Hold Time config (number) */
     if (command_topics_enabled && s_cfg.get_hold_on_ms && s_cfg.set_hold_on_ms) {
-        char payload[512]; int len=0;
+        char payload[1024]; int len=0;
         json_appendf(payload, sizeof(payload), &len,
             "{\"name\":\"Hold Time\",\"uniq_id\":\"%s_presence_timeout\",\"cmd_t\":\"%s\",\"stat_t\":\"%s\",\"min\":5,\"max\":300,\"step\":5,\"mode\":\"slider\",\"unit_of_meas\":\"s\",\"ent_cat\":\"config\",",
             s_devid, s_topic_cfg_presence_timeout_cmd, s_topic_cfg_presence_timeout_stat);
@@ -738,7 +740,7 @@ static void publish_discovery_all(void) {
 
     /* Min Range (LD2420) */
     if (command_topics_enabled && s_cfg.get_ld_min_gate && s_cfg.set_ld_min_gate) {
-        char payload[512]; int len=0;
+        char payload[1024]; int len=0;
         json_appendf(payload, sizeof(payload), &len,
             "{\"name\":\"Min Range\",\"uniq_id\":\"%s_ld_min_gate\",\"cmd_t\":\"%s\",\"stat_t\":\"%s\",\"min\":0,\"max\":15,\"step\":1,\"mode\":\"slider\",\"ent_cat\":\"config\",",
             s_devid, s_topic_cfg_ld_min_cmd, s_topic_cfg_ld_min_stat);
@@ -750,7 +752,7 @@ static void publish_discovery_all(void) {
     
     /* Max Range (LD2420) */
     if (command_topics_enabled && s_cfg.get_ld_max_gate && s_cfg.set_ld_max_gate) {
-        char payload[512]; int len=0;
+        char payload[1024]; int len=0;
         json_appendf(payload, sizeof(payload), &len,
             "{\"name\":\"Max Range\",\"uniq_id\":\"%s_ld_max_gate\",\"cmd_t\":\"%s\",\"stat_t\":\"%s\",\"min\":0,\"max\":15,\"step\":1,\"mode\":\"slider\",\"ent_cat\":\"config\",",
             s_devid, s_topic_cfg_ld_max_cmd, s_topic_cfg_ld_max_stat);
@@ -762,7 +764,7 @@ static void publish_discovery_all(void) {
     
     /* Response Delay (LD2420) */
     if (command_topics_enabled && s_cfg.get_ld_delay_ms && s_cfg.set_ld_delay_ms) {
-        char payload[512]; int len=0;
+        char payload[1024]; int len=0;
         json_appendf(payload, sizeof(payload), &len,
             "{\"name\":\"Response Delay\",\"uniq_id\":\"%s_ld_delay\",\"cmd_t\":\"%s\",\"stat_t\":\"%s\",\"min\":0,\"max\":65535,\"step\":100,\"mode\":\"slider\",\"ent_cat\":\"config\",",
             s_devid, s_topic_cfg_ld_delay_cmd, s_topic_cfg_ld_delay_stat);
@@ -774,7 +776,7 @@ static void publish_discovery_all(void) {
     
     /* Trigger Level (LD2420) */
     if (command_topics_enabled && s_cfg.get_ld_trigger_sens && s_cfg.set_ld_trigger_sens) {
-        char payload[512]; int len=0;
+        char payload[1024]; int len=0;
         json_appendf(payload, sizeof(payload), &len,
             "{\"name\":\"Trigger Level\",\"uniq_id\":\"%s_ld_trig_sens\",\"cmd_t\":\"%s\",\"stat_t\":\"%s\",\"min\":0,\"max\":65535,\"step\":10,\"mode\":\"slider\",\"ent_cat\":\"config\",",
             s_devid, s_topic_cfg_ld_trig0_cmd, s_topic_cfg_ld_trig0_stat);
@@ -786,7 +788,7 @@ static void publish_discovery_all(void) {
     
     /* Tracking Level (LD2420) */
     if (command_topics_enabled && s_cfg.get_ld_maintain_sens && s_cfg.set_ld_maintain_sens) {
-        char payload[512]; int len=0;
+        char payload[1024]; int len=0;
         json_appendf(payload, sizeof(payload), &len,
             "{\"name\":\"Tracking Level\",\"uniq_id\":\"%s_ld_maint_sens\",\"cmd_t\":\"%s\",\"stat_t\":\"%s\",\"min\":0,\"max\":65535,\"step\":10,\"mode\":\"slider\",\"ent_cat\":\"config\",",
             s_devid, s_topic_cfg_ld_hold0_cmd, s_topic_cfg_ld_hold0_stat);
@@ -799,7 +801,7 @@ static void publish_discovery_all(void) {
     /* Movement zone binary_sensors */
     const char* zone_names[] = {"Near Zone", "Mid Zone", "Far Zone"};
     for (int i = 0; i < ZONE_COUNT; ++i) {
-        char payload[1024]; int len=0;
+        char payload[2048]; int len=0;
         json_appendf(payload, sizeof(payload), &len,
             "{\"name\":\"%s\",\"uniq_id\":\"%s_movement_%d\",\"stat_t\":\"%s\",\"avty_t\":\"%s\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",",
             zone_names[i], s_devid, i+1, s_topic_zone_movement[i], s_topic_status);
@@ -819,7 +821,7 @@ static void publish_discovery_all(void) {
             const char* zone_names_lower[] = {"near", "mid", "far"};
             // Start Distance
             {
-                char payload[512]; int len=0;
+                char payload[1024]; int len=0;
                 json_appendf(payload, sizeof(payload), &len,
                     "{\"name\":\"%s Start\",\"uniq_id\":\"%s_%s_min\",\"cmd_t\":\"%s\",\"stat_t\":\"%s\",\"min\":0,\"max\":600,\"step\":10,\"mode\":\"slider\",\"unit_of_meas\":\"cm\",\"ent_cat\":\"config\",",
                     zone_display_names[i], s_devid, zone_names_lower[i], s_topic_cfg_zone_min_cmd[i], s_topic_cfg_zone_min_stat[i]);
@@ -830,7 +832,7 @@ static void publish_discovery_all(void) {
             }
             // End Distance
             {
-                char payload[512]; int len=0;
+                char payload[1024]; int len=0;
                 json_appendf(payload, sizeof(payload), &len,
                     "{\"name\":\"%s End\",\"uniq_id\":\"%s_%s_max\",\"cmd_t\":\"%s\",\"stat_t\":\"%s\",\"min\":0,\"max\":600,\"step\":10,\"mode\":\"slider\",\"unit_of_meas\":\"cm\",\"ent_cat\":\"config\",",
                     zone_display_names[i], s_devid, zone_names_lower[i], s_topic_cfg_zone_max_cmd[i], s_topic_cfg_zone_max_stat[i]);
@@ -843,7 +845,7 @@ static void publish_discovery_all(void) {
 
         /* Averaging (Distance Smoothing) */
         {
-            char payload[512]; int len=0;
+            char payload[1024]; int len=0;
             json_appendf(payload, sizeof(payload), &len,
                 "{\"name\":\"Averaging\",\"uniq_id\":\"%s_dist_smooth\",\"cmd_t\":\"%s\",\"stat_t\":\"%s\",\"min\":1,\"max\":10,\"step\":1,\"mode\":\"slider\",\"ent_cat\":\"config\",",
                 s_devid, s_topic_cfg_smooth_cmd, s_topic_cfg_smooth_stat);
@@ -863,7 +865,7 @@ static void publish_discovery_all(void) {
             }
         }
         {
-            char payload[512]; int len=0;
+            char payload[1024]; int len=0;
             if (!s_restart_migration_done) {
                 pub(s_disc_button_restart, "", 0, 1);
                 s_restart_migration_done = true;
@@ -876,7 +878,7 @@ static void publish_discovery_all(void) {
             pub(s_disc_button_restart, payload, 1, 1);
         }
         {
-            char payload[512]; int len=0;
+            char payload[1024]; int len=0;
             json_appendf(payload, sizeof(payload), &len,
                 "{\"name\":\"Resend Discovery\",\"uniq_id\":\"%s_resend_disc\",\"cmd_t\":\"%s\",\"entity_category\":\"diagnostic\",",
                 s_devid, s_topic_cmd_resend_disc);
@@ -885,7 +887,7 @@ static void publish_discovery_all(void) {
             pub(s_disc_button_resend_disc, payload, 1, 1);
         }
         {
-            char payload[512]; int len=0;
+            char payload[1024]; int len=0;
             json_appendf(payload, sizeof(payload), &len,
                 "{\"name\":\"Apply Config\",\"uniq_id\":\"%s_apply_cfg\",\"cmd_t\":\"%s\",\"entity_category\":\"config\",",
                 s_devid, s_topic_cmd_apply_cfg);
@@ -1158,6 +1160,16 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     ESP_LOGW(TAG, "Ignoring MQTT command while command topics are disabled");
                     break;
                 }
+
+                // Reject retained command messages. The device only subscribes to
+                // /cmd/* topics, so any retained inbound is a replay risk: a
+                // retained PRESS on cmd/restart would re-trigger restart on every
+                // reconnect (rate-limit window is uptime-relative and fresh after
+                // boot), producing a boot loop until the broker drops the retain.
+                if (e->retain) {
+                    ESP_LOGW(TAG, "Ignoring retained command on %.*s", tlen, t);
+                    break;
+                }
                 
                 /* Handle movement threshold command */
                 if (s_cfg.set_distance_thresh_cm && 
@@ -1200,6 +1212,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                             char buf[16]; snprintf(buf, sizeof(buf), "%d", s_cfg.get_ld_min_gate ? s_cfg.get_ld_min_gate() : v);
                             pub(s_topic_cfg_ld_min_stat, buf, 1, 1);
                             ESP_LOGI(TAG, "Set LD2420 min_gate: %d", v);
+                        } else {
+                            ESP_LOGW(TAG, "Invalid LD2420 min_gate value");
                         }
                     }
                 } else if (tlen == (int)strlen(s_topic_cfg_ld_max_cmd) && strncmp(t, s_topic_cfg_ld_max_cmd, tlen) == 0) {
@@ -1209,6 +1223,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                             char buf[16]; snprintf(buf, sizeof(buf), "%d", s_cfg.get_ld_max_gate ? s_cfg.get_ld_max_gate() : v);
                             pub(s_topic_cfg_ld_max_stat, buf, 1, 1);
                             ESP_LOGI(TAG, "Set LD2420 max_gate: %d", v);
+                        } else {
+                            ESP_LOGW(TAG, "Invalid LD2420 max_gate value");
                         }
                     }
                 } else if (tlen == (int)strlen(s_topic_cfg_ld_delay_cmd) && strncmp(t, s_topic_cfg_ld_delay_cmd, tlen) == 0) {
@@ -1218,6 +1234,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                             char buf[16]; snprintf(buf, sizeof(buf), "%d", s_cfg.get_ld_delay_ms ? s_cfg.get_ld_delay_ms() : v);
                             pub(s_topic_cfg_ld_delay_stat, buf, 1, 1);
                             ESP_LOGI(TAG, "Set LD2420 delay_time: %d ms", v);
+                        } else {
+                            ESP_LOGW(TAG, "Invalid LD2420 delay_time value");
                         }
                     }
                 } else if (tlen == (int)strlen(s_topic_cfg_ld_trig0_cmd) && strncmp(t, s_topic_cfg_ld_trig0_cmd, tlen) == 0) {
@@ -1227,6 +1245,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                             char buf[16]; snprintf(buf, sizeof(buf), "%d", s_cfg.get_ld_trigger_sens ? s_cfg.get_ld_trigger_sens() : v);
                             pub(s_topic_cfg_ld_trig0_stat, buf, 1, 1);
                             ESP_LOGI(TAG, "Set LD2420 trigger_sens: %d", v);
+                        } else {
+                            ESP_LOGW(TAG, "Invalid LD2420 trigger_sens value");
                         }
                     }
                 } else if (tlen == (int)strlen(s_topic_cfg_ld_hold0_cmd) && strncmp(t, s_topic_cfg_ld_hold0_cmd, tlen) == 0) {
@@ -1236,24 +1256,30 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                             char buf[16]; snprintf(buf, sizeof(buf), "%d", s_cfg.get_ld_maintain_sens ? s_cfg.get_ld_maintain_sens() : v);
                             pub(s_topic_cfg_ld_hold0_stat, buf, 1, 1);
                             ESP_LOGI(TAG, "Set LD2420 maintain_sens: %d", v);
+                        } else {
+                            ESP_LOGW(TAG, "Invalid LD2420 maintain_sens value");
                         }
                     }
                 }
                 
                 /* Handle zone configuration commands */
                 for (int i = 0; i < ZONE_COUNT; ++i) {
-                    if (tlen == (int)strlen(s_topic_cfg_zone_min_cmd[i]) && 
+                    if (tlen == (int)strlen(s_topic_cfg_zone_min_cmd[i]) &&
                         strncmp(t, s_topic_cfg_zone_min_cmd[i], tlen) == 0) {
                         int v;
                         if (safe_atoi(payload, payload_len, &v, 0, ZONE_DISTANCE_MAX_CM)) {
                             set_zone_boundary(i, true, v);
+                        } else {
+                            ESP_LOGW(TAG, "Invalid zone %d min value", i);
                         }
                         break;
-                    } else if (tlen == (int)strlen(s_topic_cfg_zone_max_cmd[i]) && 
+                    } else if (tlen == (int)strlen(s_topic_cfg_zone_max_cmd[i]) &&
                               strncmp(t, s_topic_cfg_zone_max_cmd[i], tlen) == 0) {
                         int v;
                         if (safe_atoi(payload, payload_len, &v, 0, ZONE_DISTANCE_MAX_CM)) {
                             set_zone_boundary(i, false, v);
+                        } else {
+                            ESP_LOGW(TAG, "Invalid zone %d max value", i);
                         }
                         break;
                     }

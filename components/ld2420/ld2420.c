@@ -520,7 +520,42 @@ esp_err_t ld2420_read_config(ld2420_t* sensor, ld2420_config_snapshot_t *out_con
     return err;
 }
 
-// Read firmware version using command 0x0000
+// Read firmware version (cmd 0x0000). Caller must hold the UART lock and the
+// radar must already be in command mode.
+static esp_err_t ld2420_read_firmware_version_locked_internal(ld2420_t* sensor, char *out, size_t out_size)
+{
+    esp_err_t err = send_frame(sensor, 0x0000, NULL, 0);
+    if (err != ESP_OK) return err;
+
+    uint8_t rx[128];
+    size_t frame_len = 0;
+    err = read_response(sensor, rx, sizeof(rx), 400, &frame_len);
+    if (err != ESP_OK) return err;
+
+    // Frame layout: header(4) + payload_len(2) + cmd(2) + status(2) + strlen(2) + str + footer(4)
+    uint16_t payload_len = (uint16_t)(rx[4] | (rx[5] << 8));
+    if (payload_len < 6) return ESP_ERR_INVALID_RESPONSE;
+
+    uint16_t status = (uint16_t)(rx[8] | (rx[9] << 8));
+    if (status != 0) {
+        ESP_LOGW(TAG, "LD2420 read FW status 0x%04X", status);
+        return ESP_FAIL;
+    }
+
+    size_t p = 6 + 4;  // skip header + payload_len + cmd + status
+    if (p + 2 > frame_len) return ESP_ERR_INVALID_RESPONSE;
+    uint16_t slen = (uint16_t)(rx[p] | (rx[p + 1] << 8));
+    p += 2;
+
+    size_t content_end = 6 + (size_t)payload_len;
+    if (p + slen > content_end) slen = (uint16_t)(content_end - p);
+    if (slen >= out_size) slen = (uint16_t)(out_size - 1);
+
+    memcpy(out, &rx[p], slen);
+    out[slen] = '\0';
+    return ESP_OK;
+}
+
 esp_err_t ld2420_read_firmware_version(ld2420_t* sensor, char *out, size_t out_size) {
     if (!sensor || !out || out_size == 0) return ESP_ERR_INVALID_ARG;
     out[0] = '\0';
@@ -529,54 +564,21 @@ esp_err_t ld2420_read_firmware_version(ld2420_t* sensor, char *out, size_t out_s
         return ESP_ERR_TIMEOUT;
     }
 
-    // Build simple frame: cmd=0x0000, no payload
-    esp_err_t err = send_frame(sensor, 0x0000, NULL, 0);
+    esp_err_t err = ld2420_enter_command_mode(sensor);
     if (err != ESP_OK) {
         uart_lock_give(sensor);
         return err;
     }
 
-    // Read ACK
-    uint8_t rx[128];
-    int len = uart_read_bytes(sensor->uart_port, rx, sizeof(rx), pdMS_TO_TICKS(300));
-    if (len <= 0) {
-        uart_lock_give(sensor);
-        return ESP_ERR_TIMEOUT;
+    err = ld2420_read_firmware_version_locked_internal(sensor, out, out_size);
+
+    esp_err_t exit_err = ld2420_exit_command_mode(sensor);
+    if (err == ESP_OK && exit_err != ESP_OK) {
+        err = exit_err;
     }
 
-    // Find header
-    int i = 0;
-    for (; i + 8 < len; ++i) {
-        if (rx[i]==0xFD && rx[i+1]==0xFC && rx[i+2]==0xFB && rx[i+3]==0xFA) break;
-    }
-    if (i + 8 >= len) {
-        uart_lock_give(sensor);
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    // Content length
-    if (i + 6 >= len) {
-        uart_lock_give(sensor);
-        return ESP_ERR_INVALID_SIZE;
-    }
-    uint16_t content_len = (uint16_t)(rx[i+4] | (rx[i+5] << 8));
-    int content_start = i + 6;
-    if (content_start + content_len > len) content_len = len - content_start;
-
-    // Expect: [cmd(2)] [status(2)] [strlen(2)] [str...]
-    if (content_len < 6) {
-        uart_lock_give(sensor);
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-    int p = content_start + 4; // skip cmd+status
-    uint16_t slen = (uint16_t)(rx[p] | (rx[p+1] << 8));
-    p += 2;
-    if (p + slen > content_start + content_len) slen = (content_start + content_len) - p;
-    if (slen >= out_size) slen = (uint16_t)(out_size - 1);
-    memcpy(out, &rx[p], slen);
-    out[slen] = '\0';
     uart_lock_give(sensor);
-    return ESP_OK;
+    return err;
 }
 
 // Set sensor to Energy Mode (structured packet output)
@@ -671,6 +673,13 @@ ld2420_t* ld2420_create(void) {
         free(sensor);
         return NULL;
     }
+    sensor->data_lock = xSemaphoreCreateMutex();
+    if (sensor->data_lock == NULL) {
+        ESP_LOGE(TAG, "Failed to create data mutex");
+        vSemaphoreDelete(sensor->uart_lock);
+        free(sensor);
+        return NULL;
+    }
     sensor->parse_state = 0;
     sensor->header_index = 0;
     sensor->data_index = 0;
@@ -683,10 +692,14 @@ void ld2420_destroy(ld2420_t* sensor) {
         return;
     }
 
-    // Delete the mutex if it exists
+    // Delete the mutexes if they exist
     if (sensor->uart_lock != NULL) {
         vSemaphoreDelete(sensor->uart_lock);
         sensor->uart_lock = NULL;
+    }
+    if (sensor->data_lock != NULL) {
+        vSemaphoreDelete(sensor->data_lock);
+        sensor->data_lock = NULL;
     }
 
     // Note: We don't delete the UART driver here because it may be shared
@@ -833,30 +846,40 @@ static void parse_energy_packet(ld2420_t* sensor) {
     // Byte 0: Presence (0=none, 1=detected)
     // Bytes 1-2: Distance (little-endian, cm)
     // Bytes 3-34: Gate energy values (16 gates * 2 bytes each)
-    
+
     uint8_t presence = sensor->data_buffer[0];
     uint16_t distance = sensor->data_buffer[1] | (sensor->data_buffer[2] << 8);
-    
+
     ESP_LOGD(TAG, "Energy packet: Presence=%d, Distance=%d cm", presence, distance);
-    
-    // Update sensor state
+
     LD2420_DetectionState new_state = presence ? LD2420_DETECTION_ACTIVE : LD2420_NO_DETECTION;
-    
-    if (new_state != sensor->current_data.state && sensor->on_state_change) {
-        sensor->on_state_change(sensor->current_data.state, new_state);
+
+    ld2420_data_t snapshot = {
+        .distance = distance,
+        .state = new_state,
+        .timestamp = esp_timer_get_time(),
+        .isValid = true,
+    };
+
+    LD2420_DetectionState old_state = LD2420_NO_DETECTION;
+    if (sensor->data_lock && xSemaphoreTake(sensor->data_lock, portMAX_DELAY) == pdTRUE) {
+        old_state = sensor->current_data.state;
+        sensor->current_data = snapshot;
+        xSemaphoreGive(sensor->data_lock);
+    } else {
+        return;
     }
-    
-    sensor->current_data.state = new_state;
-    sensor->current_data.distance = distance;
-    sensor->current_data.timestamp = esp_timer_get_time();
-    sensor->current_data.isValid = true;
-    
-    // Trigger callbacks
+
+    // Callbacks fire after releasing data_lock so they can call
+    // ld2420_get_current_data without deadlocking.
+    if (new_state != old_state && sensor->on_state_change) {
+        sensor->on_state_change(old_state, new_state);
+    }
     if (sensor->on_detection && new_state == LD2420_DETECTION_ACTIVE) {
         sensor->on_detection(distance);
     }
     if (sensor->on_data_update) {
-        sensor->on_data_update(sensor->current_data);
+        sensor->on_data_update(snapshot);
     }
 }
 
@@ -969,16 +992,19 @@ bool ld2420_is_detecting(ld2420_t* sensor) {
 }
 
 ld2420_data_t ld2420_get_current_data(ld2420_t* sensor) {
-    if (sensor == NULL) {
+    if (sensor == NULL || sensor->data_lock == NULL) {
         return (ld2420_data_t){0};
     }
 
-    if (!uart_lock_take(sensor, portMAX_DELAY)) {
-        return (ld2420_data_t){0};
-    }
-
+    // Short timeout: if a writer holds data_lock briefly we'll wait for it,
+    // but we never block on the heavy uart_lock the apply-config worker
+    // takes. Returns the last published snapshot, not zeroed data, so the
+    // OLED keeps rendering through long UART operations.
     ld2420_data_t data = sensor->current_data;
-    uart_lock_give(sensor);
+    if (xSemaphoreTake(sensor->data_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
+        data = sensor->current_data;
+        xSemaphoreGive(sensor->data_lock);
+    }
     return data;
 }
 

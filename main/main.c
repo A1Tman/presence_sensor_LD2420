@@ -11,6 +11,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "esp_err.h"
 
 #include "ld2420.h"  // LD2420 library
@@ -18,7 +19,7 @@
 #include "oled_status.h"
 #include "../config/secrets.h"
 
-#define DEVICE_VERSION "2.0.0"
+#define DEVICE_VERSION "2.1.0"
 
 // ==================== CONSTANTS ====================
 #define DIST_MIN_VALID_CM          10
@@ -36,11 +37,19 @@
 #define RAW_PRESENCE_STALE_US      (2LL * 1000000LL)
 #define MOVEMENT_LOG_INTERVAL_US   (2LL * 1000000LL)
 #define APPLY_CONFIG_TASK_STACK    4096
-#define APPLY_CONFIG_TASK_PRIO     5
+#define APPLY_CONFIG_TASK_PRIO     3
 
 #ifndef MQTT_ALLOW_ANONYMOUS_COMMANDS
 #define MQTT_ALLOW_ANONYMOUS_COMMANDS 0
 #endif
+
+// NVS keys for app-level tunables that should survive reboots. The LD2420
+// vendor params (gates, delay, sensitivities) live in the radar's own NVRAM
+// and are read back via sync_ld_config_from_sensor(), so they are not stored
+// here.
+#define APP_NVS_NAMESPACE        "ld2420_app"
+#define NVS_KEY_MOVEMENT_THRESH  "mv_thresh"
+#define NVS_KEY_PRESENCE_TIMEOUT "pres_to_s"
 
 // Pin configuration
 #define UART_PORT UART_NUM_1
@@ -195,6 +204,51 @@ void onDataUpdate(ld2420_data_t data) {
     }
 }
 
+// ==================== NVS PERSISTENCE ====================
+static void app_config_save_i32(const char *key, int32_t value) {
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(APP_NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "NVS open for write failed: %s", esp_err_to_name(err));
+        return;
+    }
+    int32_t existing;
+    if (nvs_get_i32(h, key, &existing) == ESP_OK && existing == value) {
+        nvs_close(h);
+        return;
+    }
+    err = nvs_set_i32(h, key, value);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "NVS save %s failed: %s", key, esp_err_to_name(err));
+    }
+}
+
+// Restore persisted tunables. Called once at boot, after nvs_flash_init.
+// Out-of-range values are ignored so a corrupted entry can't push the device
+// outside its operating envelope.
+static void app_config_load(void) {
+    nvs_handle_t h;
+    if (nvs_open(APP_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return;
+    }
+    int32_t v;
+    if (nvs_get_i32(h, NVS_KEY_MOVEMENT_THRESH, &v) == ESP_OK &&
+        v >= MOVEMENT_THRESHOLD_MIN_CM && v <= MOVEMENT_THRESHOLD_MAX_CM) {
+        s_movement_threshold_cm = (int)v;
+        ESP_LOGI(TAG, "NVS restored movement_threshold = %d cm", s_movement_threshold_cm);
+    }
+    if (nvs_get_i32(h, NVS_KEY_PRESENCE_TIMEOUT, &v) == ESP_OK &&
+        v >= PRESENCE_TIMEOUT_MIN_S && v <= PRESENCE_TIMEOUT_MAX_S) {
+        s_presence_timeout_sec = (int)v;
+        ESP_LOGI(TAG, "NVS restored presence_timeout = %d s", s_presence_timeout_sec);
+    }
+    nvs_close(h);
+}
+
 // ==================== CONFIG FUNCTIONS FOR HA SLIDERS ====================
 static int get_movement_threshold(void) {
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
@@ -202,13 +256,15 @@ static int get_movement_threshold(void) {
     xSemaphoreGive(s_state_mutex);
     return v;
 }
-static void set_movement_threshold(int val) { 
+static void set_movement_threshold(int val) {
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     if (val < MOVEMENT_THRESHOLD_MIN_CM) val = MOVEMENT_THRESHOLD_MIN_CM;
     if (val > MOVEMENT_THRESHOLD_MAX_CM) val = MOVEMENT_THRESHOLD_MAX_CM;
     s_movement_threshold_cm = val;
+    int saved = s_movement_threshold_cm;
     xSemaphoreGive(s_state_mutex);
-    ESP_LOGI(TAG, "Movement threshold set to %d cm", s_movement_threshold_cm);
+    ESP_LOGI(TAG, "Movement threshold set to %d cm", saved);
+    app_config_save_i32(NVS_KEY_MOVEMENT_THRESH, saved);
 }
 
 static int get_presence_timeout_ms(void) { 
@@ -217,14 +273,16 @@ static int get_presence_timeout_ms(void) {
     xSemaphoreGive(s_state_mutex);
     return v;
 }
-static void set_presence_timeout_ms(int val_ms) { 
+static void set_presence_timeout_ms(int val_ms) {
     int val_sec = val_ms / 1000;  // Convert from ms
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     if (val_sec < PRESENCE_TIMEOUT_MIN_S) val_sec = PRESENCE_TIMEOUT_MIN_S;
     if (val_sec > PRESENCE_TIMEOUT_MAX_S) val_sec = PRESENCE_TIMEOUT_MAX_S;
     s_presence_timeout_sec = val_sec;
+    int saved = s_presence_timeout_sec;
     xSemaphoreGive(s_state_mutex);
-    ESP_LOGI(TAG, "Presence timeout set to %d seconds", s_presence_timeout_sec);
+    ESP_LOGI(TAG, "Presence timeout set to %d seconds", saved);
+    app_config_save_i32(NVS_KEY_PRESENCE_TIMEOUT, saved);
 }
 
 // LD2420 tuning get/set (exposed to MQTT)
@@ -529,6 +587,7 @@ static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_
         }
         ESP_LOGI(TAG, "WiFi connected: " IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
+        xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         start_mqtt();
     }
@@ -598,6 +657,9 @@ void app_main(void) {
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    // Restore persisted tunables before anything reads or publishes them.
+    app_config_load();
 
     if (!oled_status_init(collect_oled_snapshot, DEVICE_VERSION)) {
         ESP_LOGW(TAG, "OLED status display init failed");

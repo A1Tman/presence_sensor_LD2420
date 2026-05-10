@@ -275,7 +275,7 @@ static void emit_connected(void) {
     mqtt_event_handler(NULL, NULL, MQTT_EVENT_CONNECTED, &event);
 }
 
-static void emit_data(const char *topic, const char *payload) {
+static void emit_data_ex(const char *topic, const char *payload, int retain) {
     esp_mqtt_event_t event = {
         .topic = topic,
         .topic_len = (int)strlen(topic),
@@ -283,8 +283,17 @@ static void emit_data(const char *topic, const char *payload) {
         .data_len = (int)strlen(payload),
         .total_data_len = (int)strlen(payload),
         .current_data_offset = 0,
+        .retain = retain,
     };
     mqtt_event_handler(NULL, NULL, MQTT_EVENT_DATA, &event);
+}
+
+static void emit_data(const char *topic, const char *payload) {
+    emit_data_ex(topic, payload, 0);
+}
+
+static void emit_retained_data(const char *topic, const char *payload) {
+    emit_data_ex(topic, payload, 1);
 }
 
 static void test_discovery_without_command_topics(void) {
@@ -338,6 +347,10 @@ static void test_command_validation_and_gating(void) {
     emit_connected();
     emit_data("presence/presence-bacad4/cmd/movement_threshold_cm", "bad");
     assert(g_movement_threshold == 5);
+    emit_data("presence/presence-bacad4/cmd/movement_threshold_cm", "   ");
+    assert(g_movement_threshold == 5);
+    emit_retained_data("presence/presence-bacad4/cmd/movement_threshold_cm", "12");
+    assert(g_movement_threshold == 5);
     emit_data("presence/presence-bacad4/cmd/movement_threshold_cm", "12");
     assert(g_movement_threshold == 12);
 
@@ -354,4 +367,3 @@ int main(void) {
     test_command_validation_and_gating();
     return 0;
 }
-

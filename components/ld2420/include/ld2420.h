@@ -41,6 +41,10 @@ struct ld2420_t {
     uart_port_t uart_port;
     ld2420_data_t current_data;
     SemaphoreHandle_t uart_lock;  // Recursive mutex - allows nested locking by same task
+    SemaphoreHandle_t data_lock;  // Lightweight mutex guarding current_data reads/writes;
+                                  // independent of uart_lock so snapshot readers (OLED,
+                                  // status loop) do not block on long UART operations
+                                  // such as apply-config bursts.
 
     // Callbacks
     ld2420_detection_cb on_detection;

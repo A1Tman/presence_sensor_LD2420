@@ -37,6 +37,7 @@ typedef struct esp_mqtt_event {
     int data_len;
     int total_data_len;
     int current_data_offset;
+    int retain;
     esp_mqtt_error_codes_t *error_handle;
     int protocol_ver;
     int session_present;
@@ -101,4 +102,3 @@ esp_err_t esp_mqtt_client_start(esp_mqtt_client_handle_t client);
 esp_err_t esp_mqtt_client_stop(esp_mqtt_client_handle_t client);
 esp_err_t esp_mqtt_client_destroy(esp_mqtt_client_handle_t client);
 esp_err_t esp_mqtt_client_reconnect(esp_mqtt_client_handle_t client);
-

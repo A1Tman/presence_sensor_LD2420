@@ -13,6 +13,7 @@ static uint8_t g_uart_rx[512];
 static size_t g_uart_rx_len;
 static size_t g_uart_rx_pos;
 static TickType_t g_tick;
+static int g_fail_next_mutex_take;
 
 static void feed_uart(const uint8_t *data, size_t len) {
     assert(len <= sizeof(g_uart_rx));
@@ -52,6 +53,10 @@ SemaphoreHandle_t xSemaphoreCreateRecursiveMutex(void) {
 BaseType_t xSemaphoreTake(SemaphoreHandle_t semaphore, TickType_t ticks) {
     (void)semaphore;
     (void)ticks;
+    if (g_fail_next_mutex_take) {
+        g_fail_next_mutex_take = 0;
+        return pdFALSE;
+    }
     return pdTRUE;
 }
 
@@ -156,6 +161,7 @@ static ld2420_t test_sensor(void) {
     ld2420_t sensor = {
         .uart_port = 1,
         .uart_lock = (SemaphoreHandle_t)0x1,
+        .data_lock = (SemaphoreHandle_t)0x2,
     };
     return sensor;
 }
@@ -236,11 +242,28 @@ static void test_read_ack_status_failure(void) {
     printf("ok ld2420_read_ack_status_failure\n");
 }
 
+static void test_get_current_data_timeout_returns_last_snapshot(void) {
+    ld2420_t sensor = test_sensor();
+    sensor.current_data = (ld2420_data_t) {
+        .state = LD2420_DETECTION_ACTIVE,
+        .distance = 123,
+        .timestamp = 456,
+        .isValid = true,
+    };
+    g_fail_next_mutex_take = 1;
+    ld2420_data_t data = ld2420_get_current_data(&sensor);
+    assert(data.state == LD2420_DETECTION_ACTIVE);
+    assert(data.distance == 123);
+    assert(data.timestamp == 456);
+    assert(data.isValid);
+    printf("ok ld2420_get_current_data_timeout_returns_last_snapshot\n");
+}
+
 int main(void) {
     test_read_response_skips_noise();
     test_read_response_rejects_bad_footer_then_recovers();
     test_read_response_times_out_on_partial_frame();
     test_read_ack_status_failure();
+    test_get_current_data_timeout_returns_last_snapshot();
     return 0;
 }
-
