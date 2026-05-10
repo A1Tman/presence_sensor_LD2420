@@ -130,6 +130,10 @@ typedef struct {
     char data[MQTT_RX_PAYLOAD_MAX_LEN + 1];
 } mqtt_rx_assembly_t;
 
+// Reassembly buffer for fragmented MQTT_EVENT_DATA payloads. Accessed only
+// from the esp-mqtt event task, which is single-threaded, so no lock is
+// needed. If you ever dispatch MQTT events from multiple tasks this becomes
+// unsafe.
 static mqtt_rx_assembly_t s_mqtt_rx = {0};
 
 #define RESTART_MIN_INTERVAL_US (30LL * 1000000LL)
@@ -1479,8 +1483,8 @@ void ha_mqtt_publish_presence(bool present, int distance_mm) {
         s_last_distance_mm = distance_mm;
 
         if (distance_mm >= 0 && s_cfg.distance_supported) {
-            if (s_smooth_win < 1) s_smooth_win = 1;
-            if (s_smooth_win > 10) s_smooth_win = 10;
+            // s_smooth_win is bounded to [1, 10] at the only setter via
+            // safe_atoi range check; no runtime clamp needed here.
 
             s_smooth_ring[s_smooth_head] = distance_mm;
             s_smooth_head = (s_smooth_head + 1) % SMOOTH_BUFFER_SIZE;
