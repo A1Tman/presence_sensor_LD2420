@@ -84,6 +84,23 @@ if ($imageVersion -ne $projectVersion) {
     throw "Build is version '$imageVersion' but PROJECT_VER is '$projectVersion' - rebuild first."
 }
 
+# Credentials must never be inside a hosted image. Compare the raw bytes with
+# the passwords in config/creds.csv (values are never printed). The MQTT user
+# name is not checked: it is not secret and "presence_sensor" is also part of
+# the project name embedded in every image.
+$credsFile = Join-Path $Root "config\creds.csv"
+if (Test-Path $credsFile) {
+    $latin1 = [Text.Encoding]::GetEncoding(28591)
+    $haystack = $latin1.GetString($bytes)
+    $leaks = Get-Content $credsFile | Where-Object { $_ -notmatch '^\s*#' } | ConvertFrom-Csv |
+        Where-Object { $_.type -eq 'data' -and $_.key -in 'wifi_pass', 'mqtt_pass' -and $_.value.Length -ge 4 } |
+        Where-Object { $haystack.Contains($latin1.GetString([Text.Encoding]::UTF8.GetBytes($_.value))) } |
+        ForEach-Object { $_.key }
+    if ($leaks) { throw "Image contains credential value(s) for: $($leaks -join ', '). Refusing to publish." }
+} else {
+    Write-Warning "config/creds.csv not found; skipping the credential leak check."
+}
+
 $python = if ($env:IDF_PYTHON_ENV_PATH) { Join-Path $env:IDF_PYTHON_ENV_PATH "Scripts\python.exe" } else { "python" }
 & $python -m espsecure verify_signature --version 2 --keyfile $PubKey $Bin *> $null
 if ($LASTEXITCODE -ne 0) {

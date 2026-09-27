@@ -19,7 +19,14 @@
 #include "ha_mqtt.h"
 #include "oled_status.h"
 #include "ota_update.h"
+#include "device_creds.h"
 #include "../config/secrets.h"
+
+// Wi-Fi/MQTT credentials now come from the "creds" NVS partition
+// (tools/provision.ps1). Values left in secrets.h are ignored.
+#if defined(WIFI_SSID) || defined(WIFI_PASSWORD) || defined(MQTT_USERNAME) || defined(MQTT_PASSWORD)
+#warning "WIFI_*/MQTT_USERNAME/MQTT_PASSWORD in secrets.h are ignored; move them to config/creds.csv and remove them"
+#endif
 
 #define DEVICE_VERSION (esp_app_get_description()->version)  // PROJECT_VER in CMakeLists.txt
 
@@ -99,6 +106,8 @@ static bool s_sensor_ready = false;
 static bool s_wifi_connected = false;
 static uint8_t s_ip_last_octet = 0;
 static char s_ld_fw_version[16] = "?";
+static device_creds_t s_creds;          // loaded once at boot, read-only after
+static bool s_creds_ok = false;
 
 // LD2420 tuning (current values)
 static int s_ld_min_gate = 0;        // 0..15
@@ -516,6 +525,7 @@ static void collect_oled_snapshot(oled_status_snapshot_t *out_snapshot) {
     xSemaphoreGive(s_state_mutex);
 
     out_snapshot->mqtt_connected = ha_mqtt_is_connected();
+    out_snapshot->creds_missing = !s_creds_ok;
 
     if (out_snapshot->wifi_connected) {
         wifi_ap_record_t ap_info = {0};
@@ -545,14 +555,14 @@ static void start_mqtt(void) {
     const char *scheme = (ca_pem != NULL) ? "mqtts" : "mqtt";
     snprintf(uri, sizeof(uri), "%s://%s:%d", scheme, MQTT_BROKER_HOST, MQTT_BROKER_PORT);
 
-    bool mqtt_credentials_configured = (MQTT_USERNAME[0] != '\0');
+    bool mqtt_credentials_configured = (s_creds.mqtt_user[0] != '\0');
     bool tls_enabled = (ca_pem != NULL);
     bool auth_ok = mqtt_credentials_configured || MQTT_ALLOW_ANONYMOUS_COMMANDS;
     bool transport_ok = tls_enabled || MQTT_ALLOW_INSECURE_COMMANDS;
     bool command_topics_enabled = auth_ok && transport_ok;
 
     if (!auth_ok) {
-        ESP_LOGW(TAG, "MQTT command topics disabled: configure MQTT_USERNAME or set MQTT_ALLOW_ANONYMOUS_COMMANDS=1");
+        ESP_LOGW(TAG, "MQTT command topics disabled: provision mqtt_user (tools/provision.ps1) or set MQTT_ALLOW_ANONYMOUS_COMMANDS=1");
     } else if (!transport_ok) {
         ESP_LOGW(TAG, "MQTT command topics disabled: TLS required (define MQTT_BROKER_CA_CERT_PEM, or set MQTT_ALLOW_INSECURE_COMMANDS=1 to opt in to plaintext)");
     } else if (!tls_enabled) {
@@ -561,8 +571,8 @@ static void start_mqtt(void) {
 
     ha_mqtt_cfg_t cfg = {
         .broker_uri = uri,
-        .username = MQTT_USERNAME[0] ? MQTT_USERNAME : NULL,
-        .password = MQTT_PASSWORD[0] ? MQTT_PASSWORD : NULL,
+        .username = s_creds.mqtt_user[0] ? s_creds.mqtt_user : NULL,
+        .password = s_creds.mqtt_pass[0] ? s_creds.mqtt_pass : NULL,
         .friendly_name = DEVICE_NAME,
         .suggested_area = DEVICE_LOCATION,
         .app_version = DEVICE_VERSION,
@@ -592,6 +602,23 @@ static void start_mqtt(void) {
     ha_mqtt_init(&cfg);
     ha_mqtt_start();
     s_mqtt_initialized = true;
+}
+
+// Firmware before 2.4.0 let the Wi-Fi driver persist its config (SSID and
+// passphrase) in the default NVS namespace "nvs.net80211". Drop those entries
+// now that the driver runs with WIFI_STORAGE_RAM. NVS marks entries erased;
+// the page itself is reclaimed later by NVS garbage collection.
+static void purge_wifi_driver_nvs(void) {
+    nvs_handle_t h;
+    if (nvs_open("nvs.net80211", NVS_READONLY, &h) != ESP_OK) return;  // never created
+    nvs_close(h);
+    if (nvs_open("nvs.net80211", NVS_READWRITE, &h) != ESP_OK) return;
+    esp_err_t err = nvs_erase_all(h);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Could not purge stored Wi-Fi driver config: %s", esp_err_to_name(err));
+    }
 }
 
 // ==================== WIFI ====================
@@ -649,14 +676,20 @@ static esp_err_t wifi_init(void) {
 
     wifi_config_t wifi_config = {
         .sta = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASSWORD,
             // Reject APs weaker than WPA2-PSK so an evil-twin open/WEP/WPA1
             // AP advertising the same SSID cannot lure the device off-network.
             .threshold.authmode = WIFI_AUTH_WPA2_PSK,
             .pmf_cfg = { .capable = true, .required = false },
         },
     };
+
+    // Keep the driver's copy of the config in RAM: the creds partition is the
+    // only place the passphrase is stored.
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+
+    // Lengths are bounded by device_creds_t (ssid 32, password 64).
+    memcpy(wifi_config.sta.ssid, s_creds.wifi_ssid, strnlen(s_creds.wifi_ssid, sizeof(wifi_config.sta.ssid)));
+    memcpy(wifi_config.sta.password, s_creds.wifi_pass, strnlen(s_creds.wifi_pass, sizeof(wifi_config.sta.password)));
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
@@ -699,6 +732,9 @@ void app_main(void) {
 
     // Arm the rollback guard before anything below can return early.
     ota_update_init(OTA_ROLLBACK_TIMEOUT_S);
+
+    s_creds_ok = (device_creds_load(&s_creds) == ESP_OK);
+    purge_wifi_driver_nvs();
 
     // Restore persisted tunables before anything reads or publishes them.
     app_config_load();
@@ -778,10 +814,14 @@ void app_main(void) {
 
     // Initialize WiFi and MQTT after the sensor state is fully synchronized so
     // Home Assistant sees the actual LD2420 config on first connect.
-    ESP_LOGI(TAG, "Starting WiFi...");
-    esp_err_t wifi_rc = wifi_init();
-    if (wifi_rc != ESP_OK) {
-        ESP_LOGW(TAG, "wifi_init returned %s; continuing, background retries may proceed", esp_err_to_name(wifi_rc));
+    if (s_creds_ok) {
+        ESP_LOGI(TAG, "Starting WiFi...");
+        esp_err_t wifi_rc = wifi_init();
+        if (wifi_rc != ESP_OK) {
+            ESP_LOGW(TAG, "wifi_init returned %s; continuing, background retries may proceed", esp_err_to_name(wifi_rc));
+        }
+    } else {
+        ESP_LOGE(TAG, "No network credentials provisioned - staying offline. Run tools/provision.ps1");
     }
     
     // MAIN LOOP WITH MQTT ADDITIONS

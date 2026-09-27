@@ -78,7 +78,10 @@ static void render_fault_screen(const oled_status_snapshot_t *snapshot)
 {
     char lines[OLED_BODY_LINE_COUNT][OLED_LINE_LEN] = {{0}};
 
-    if (!snapshot->sensor_ready) {
+    if (snapshot->creds_missing) {
+        snprintf(lines[0], sizeof(lines[0]), "No creds");
+        snprintf(lines[1], sizeof(lines[1]), "Provision");
+    } else if (!snapshot->sensor_ready) {
         snprintf(lines[0], sizeof(lines[0]), "Radar init");
         snprintf(lines[1], sizeof(lines[1]), "Check UART");
     } else if (!snapshot->sensor_packets_valid) {
@@ -161,7 +164,7 @@ static void oled_status_task(void *arg)
 
         uint32_t elapsed_ms = (uint32_t)(pdTICKS_TO_MS(xTaskGetTickCount() - s_started_at));
         bool boot_screen = elapsed_ms < OLED_BOOT_SCREEN_MS;
-        bool fault = !snapshot.sensor_ready || !snapshot.sensor_packets_valid ||
+        bool fault = snapshot.creds_missing || !snapshot.sensor_ready || !snapshot.sensor_packets_valid ||
                      !snapshot.wifi_connected || !snapshot.mqtt_connected;
 
         if (boot_screen) {

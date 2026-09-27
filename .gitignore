@@ -4,6 +4,7 @@ sdkconfig
 sdkconfig.old
 secrets.h
 config/secrets.h
+config/creds.csv
 tmp_app
 tmp_show
 main/old_versions

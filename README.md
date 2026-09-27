@@ -25,6 +25,17 @@ idf.py set-target esp32c3
 idf.py build flash monitor
 ```
 
+## Credentials (provisioning)
+
+Wi-Fi and MQTT credentials are **not compiled into the firmware**. They live in a separate `creds` NVS partition (`partitions.csv`) that is written over USB and never touched by OTA, so a firmware image can be shared or hosted without exposing them.
+
+1. Copy `config/creds.csv.template` to `config/creds.csv` (git-ignored) and fill in `wifi_ssid`, `wifi_pass`, `mqtt_user`, `mqtt_pass`.
+2. With the board on USB: `./tools/provision.ps1 -Port COM3`. It generates the NVS image, flashes it to the `creds` partition and deletes the temporary image. The device restarts and connects.
+
+To rotate a password, edit `creds.csv` and run `provision.ps1` again; no rebuild is needed. Without provisioned credentials the device stays offline and the OLED shows `No creds / Provision`. `config/secrets.h` keeps only non-secret settings (broker host/port, CA certificate, device name).
+
+Never attach built firmware to GitHub releases: OTA goes through `tools/ota_release.ps1`, which also refuses to publish an image that contains a password from `creds.csv`.
+
 ## Tests
 
 Fast host-side harness tests cover MQTT discovery/command behavior and LD2420 command-frame parsing:
@@ -120,7 +131,7 @@ Upload (“energy”) data:
 ## Security
 
 - TLS: define a CA PEM in `config/secrets.h`; the client switches to `mqtts://` with server validation.
-- Credentials: per‑device user/password supported. Command entities are enabled only when `MQTT_USERNAME` is set, unless `MQTT_ALLOW_ANONYMOUS_COMMANDS` is explicitly set to `1`.
+- Credentials: provisioned into the `creds` partition (see *Credentials*), never compiled into firmware. Command entities are enabled only when `mqtt_user` is provisioned, unless `MQTT_ALLOW_ANONYMOUS_COMMANDS` is explicitly set to `1`. The partition is not encrypted, so anyone with physical access to the board can read it.
 - Safety: Apply/Restart are press‑only and rate‑limited. Use broker ACLs so each device/user can publish only to the intended `presence/<device-id>/cmd/...` topics.
 
 ## Files
@@ -129,4 +140,6 @@ Upload (“energy”) data:
 - `components/ha_mqtt`: MQTT + HA discovery and entities
 - `components/ota_update`: OTA download/verify/flash and rollback guard
 - `tools/ota_release.ps1`: publish a build as an OTA update via Home Assistant
+- `tools/provision.ps1`: write Wi-Fi/MQTT credentials to the `creds` partition over USB
+- `main/device_creds.c`: load credentials from the `creds` partition at boot
 - `main`: app wiring, logic, and MQTT integration

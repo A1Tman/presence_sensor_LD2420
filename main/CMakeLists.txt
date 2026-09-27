@@ -1,7 +1,7 @@
 # main/CMakeLists.txt
 
 idf_component_register(
-    SRCS "main.c" "oled_status.c"
+    SRCS "main.c" "oled_status.c" "device_creds.c"
     INCLUDE_DIRS "."
     REQUIRES 
         esp_wifi 

@@ -13,6 +13,7 @@ typedef struct {
     bool presence;
     bool wifi_connected;
     bool mqtt_connected;
+    bool creds_missing;      // no Wi-Fi/MQTT credentials provisioned
     int distance_cm;
     int rssi_dbm;
     uint8_t ip_last_octet;

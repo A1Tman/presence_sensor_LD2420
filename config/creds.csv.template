@@ -1,0 +1,11 @@
+# Copy to config/creds.csv (git-ignored) and fill in, then run
+#   ./tools/provision.ps1 -Port COM3
+# Values are written to the device's "creds" partition over USB and are never
+# compiled into firmware. Quote a value if it contains a comma or quote
+# ("pa,ss" / "pa""ss"). mqtt_user/mqtt_pass may be left empty for anonymous.
+key,type,encoding,value
+creds,namespace,,
+wifi_ssid,data,string,YOUR_WIFI_SSID
+wifi_pass,data,string,YOUR_WIFI_PASSWORD
+mqtt_user,data,string,presence_sensor
+mqtt_pass,data,string,YOUR_MQTT_PASSWORD
