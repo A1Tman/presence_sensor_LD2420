@@ -16,7 +16,9 @@
   device reports the new version).
 
   The MQTT user needs write access to presence/+/cmd/ota/manifest. The
-  password is read from $env:LD2420_OTA_MQTT_PASSWORD or prompted for.
+  password is read from $env:LD2420_OTA_MQTT_PASSWORD, else from
+  -SecretFile (default ~/.esp-keys/ld2420_ota_mqtt_password.txt), else
+  prompted for.
 
 .EXAMPLE
   ./tools/ota_release.ps1 -Notes "Fix zone flicker"
@@ -29,6 +31,7 @@ param(
     [string]$DeviceId = "presence-bacad4",
     [string]$MqttUser = "ota_release",
     [string]$Notes = "",
+    [string]$SecretFile = (Join-Path $env:USERPROFILE ".esp-keys\ld2420_ota_mqtt_password.txt"),
     [switch]$Clean
 )
 
@@ -45,6 +48,7 @@ if ($MqttUser -notmatch '^[A-Za-z0-9_.-]+$') { throw "Unexpected MqttUser '$Mqtt
 
 function Get-MqttPassword {
     if ($env:LD2420_OTA_MQTT_PASSWORD) { return $env:LD2420_OTA_MQTT_PASSWORD }
+    if (Test-Path $SecretFile) { return (Get-Content $SecretFile -Raw).Trim() }
     $secure = Read-Host "MQTT password for '$MqttUser'" -AsSecureString
     return [Net.NetworkCredential]::new("", $secure).Password
 }

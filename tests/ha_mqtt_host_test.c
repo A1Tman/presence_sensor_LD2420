@@ -443,6 +443,9 @@ static void test_ota_discovery_and_initial_state(void) {
     assert(last_payload_contains(OTA_STATE, "\"installed_version\":\"9.8.7\""));
     assert(last_payload_contains(OTA_STATE, "\"latest_version\":\"9.8.7\""));
     assert(last_payload_contains(OTA_STATE, "\"in_progress\":false"));
+    // HA rejects the whole state if release_summary is null.
+    assert(last_payload_contains(OTA_STATE, "\"release_summary\":\"\""));
+    assert(!last_payload_contains(OTA_STATE, "\"release_summary\":null"));
 
     reset_component(false);
     emit_connected();

@@ -1196,11 +1196,9 @@ static void publish_ota_state(void) {
     } else {
         json_appendf(json, sizeof(json), &len, "\"update_percentage\":null,");
     }
-    if (summary[0]) {
-        json_appendf(json, sizeof(json), &len, "\"release_summary\":\"%s\"}", summary_esc);
-    } else {
-        json_appendf(json, sizeof(json), &len, "\"release_summary\":null}");
-    }
+    // HA's MQTT update schema requires a string here; null is rejected and
+    // drops the whole state update. "" clears a previous summary.
+    json_appendf(json, sizeof(json), &len, "\"release_summary\":\"%s\"}", summary_esc);
     if (len < 0) {
         ESP_LOGW(TAG, "OTA state payload truncated");
         return;

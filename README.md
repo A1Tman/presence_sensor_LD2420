@@ -82,7 +82,7 @@ Safety nets:
 
 - **Signed images only** (`CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT`, RSA-3072). OTA images must be signed with the private key at `CONFIG_SECURE_BOOT_SIGNING_KEY` (kept outside the repo; back it up). The public key is `tools/ota_signing_pubkey.pem`. This is not Secure Boot: no eFuses are burned and USB flashing accepts any image.
 - **Automatic rollback**: a new image must connect to MQTT and receive valid radar frames within 5 minutes (`OTA_ROLLBACK_TIMEOUT_S`), or it reboots into the previous image. Crashes before that also roll back.
-- The release script needs an MQTT login (default `ota_release`) that can publish `presence/+/cmd/ota/manifest`; the password comes from `LD2420_OTA_MQTT_PASSWORD` or a prompt.
+- The release script needs an MQTT login (default `ota_release`) that can publish `presence/+/cmd/ota/manifest`; the password comes from `LD2420_OTA_MQTT_PASSWORD`, `~/.esp-keys/ld2420_ota_mqtt_password.txt`, or a prompt. The device's own MQTT user should only be able to *read* `presence/<device-id>/cmd/#`, so a leaked device credential cannot push commands or releases.
 
 ## LD2420 Protocol (short version)
 
