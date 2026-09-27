@@ -7,6 +7,7 @@
 
 #define CONFIG_MQTT_PROTOCOL_5 1
 
+#include "esp_chip_info.h"
 #include "esp_system.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
@@ -43,6 +44,8 @@ static int g_ld_trigger = 60000;
 static int g_ld_maintain = 40000;
 static esp_mqtt_client_config_t g_last_client_config;
 static int g_client_started;
+static int g_ota_calls;
+static bool g_ota_start_ok = true;
 
 static void reset_records(void) {
     memset(g_publishes, 0, sizeof(g_publishes));
@@ -52,6 +55,8 @@ static void reset_records(void) {
     g_restart_called = 0;
     g_apply_called = 0;
     g_client_started = 0;
+    g_ota_calls = 0;
+    g_ota_start_ok = true;
     memset(&g_last_client_config, 0, sizeof(g_last_client_config));
 }
 
@@ -72,6 +77,18 @@ static bool payload_contains_for_topic(const char *topic_needle, const char *pay
     return false;
 }
 
+static const char *last_payload_for_topic(const char *topic_needle) {
+    for (int i = g_publish_count - 1; i >= 0; --i) {
+        if (strstr(g_publishes[i].topic, topic_needle)) return g_publishes[i].payload;
+    }
+    return NULL;
+}
+
+static bool last_payload_contains(const char *topic_needle, const char *payload_needle) {
+    const char *payload = last_payload_for_topic(topic_needle);
+    return payload && strstr(payload, payload_needle);
+}
+
 static bool subscribed_to(const char *topic_needle) {
     for (int i = 0; i < g_subscribe_count; ++i) {
         if (strstr(g_subscribes[i].topic, topic_needle)) return true;
@@ -84,9 +101,15 @@ static void set_movement_threshold(int value) { g_movement_threshold = value; }
 static int get_hold_on_ms(void) { return g_hold_on_ms; }
 static void set_hold_on_ms(int value) { g_hold_on_ms = value; }
 static int get_ld_min_gate(void) { return g_ld_min_gate; }
-static void set_ld_min_gate(int value) { g_ld_min_gate = value; }
+static void set_ld_min_gate(int value) {
+    g_ld_min_gate = value;
+    if (g_ld_min_gate > g_ld_max_gate) g_ld_max_gate = g_ld_min_gate;
+}
 static int get_ld_max_gate(void) { return g_ld_max_gate; }
-static void set_ld_max_gate(int value) { g_ld_max_gate = value; }
+static void set_ld_max_gate(int value) {
+    g_ld_max_gate = value;
+    if (g_ld_max_gate < g_ld_min_gate) g_ld_min_gate = g_ld_max_gate;
+}
 static int get_ld_delay_ms(void) { return g_ld_delay_ms; }
 static void set_ld_delay_ms(int value) { g_ld_delay_ms = value; }
 static int get_ld_trigger(void) { return g_ld_trigger; }
@@ -95,9 +118,29 @@ static int get_ld_maintain(void) { return g_ld_maintain; }
 static void set_ld_maintain(int value) { g_ld_maintain = value; }
 static void apply_config(void) { g_apply_called++; }
 
+static char g_ota_url[256];
+static char g_ota_sha[65];
+static uint32_t g_ota_size;
+static char g_ota_version[32];
+static bool ota_install(const char *url, const char *sha256_hex, uint32_t size, const char *version) {
+    g_ota_calls++;
+    snprintf(g_ota_url, sizeof(g_ota_url), "%s", url);
+    snprintf(g_ota_sha, sizeof(g_ota_sha), "%s", sha256_hex);
+    g_ota_size = size;
+    snprintf(g_ota_version, sizeof(g_ota_version), "%s", version);
+    return g_ota_start_ok;
+}
+
 void esp_efuse_mac_get_default(uint8_t mac[6]) {
     const uint8_t fake[6] = {0x50, 0x78, 0x7d, 0xba, 0xca, 0xd4};
     memcpy(mac, fake, sizeof(fake));
+}
+
+void esp_chip_info(esp_chip_info_t *out_info) {
+    memset(out_info, 0, sizeof(*out_info));
+    out_info->model = CHIP_ESP32C3;
+    out_info->revision = 4;
+    out_info->cores = 1;
 }
 
 esp_netif_t *esp_netif_get_handle_from_ifkey(const char *ifkey) {
@@ -253,6 +296,7 @@ static ha_mqtt_cfg_t base_config(bool commands_enabled) {
         .get_ld_maintain_sens = get_ld_maintain,
         .set_ld_maintain_sens = set_ld_maintain,
         .action_apply_config = apply_config,
+        .action_ota_install = ota_install,
     };
     return cfg;
 }
@@ -318,6 +362,10 @@ static void test_discovery_with_command_topics(void) {
     assert(payload_contains_for_topic("button/presence-bacad4/apply_config/config", "\"cmd_t\""));
     assert(subscribed_to("/cmd/movement_threshold_cm"));
     assert(subscribed_to("/cmd/apply_config"));
+    assert(payload_contains_for_topic("binary_sensor/presence-bacad4/presence/config",
+                                      "\"hw\":\"ESP32-C3 rev v0.4\""));
+    assert(payload_contains_for_topic("binary_sensor/presence-bacad4/presence/config",
+                                      "\"sn\":\"50787DBACAD4\""));
 
     printf("ok discovery_with_command_topics\n");
 }
@@ -360,10 +408,164 @@ static void test_command_validation_and_gating(void) {
     printf("ok command_validation_and_gating\n");
 }
 
+static void test_ld_gate_normalization_republishes_pair(void) {
+    reset_component(true);
+    emit_connected();
+    reset_records();
+
+    emit_data("presence/presence-bacad4/cmd/ld2420/min_gate", "15");
+
+    assert(g_ld_min_gate == 15);
+    assert(g_ld_max_gate == 15);
+    assert(payload_contains_for_topic("presence/presence-bacad4/cfg/ld2420/min_gate", "15"));
+    assert(payload_contains_for_topic("presence/presence-bacad4/cfg/ld2420/max_gate", "15"));
+
+    printf("ok ld_gate_normalization_republishes_pair\n");
+}
+
+#define OTA_STATE    "presence/presence-bacad4/ota/state"
+#define OTA_MANIFEST "presence/presence-bacad4/cmd/ota/manifest"
+#define OTA_INSTALL  "presence/presence-bacad4/cmd/ota/install"
+#define OTA_SHA      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+#define OTA_GOOD_MANIFEST \
+    "{\"version\":\"9.9.0\",\"url\":\"http://192.168.1.62:8123/local/ota/x/fw.bin\"," \
+    "\"sha256\":\"" OTA_SHA "\",\"size\":1245184,\"notes\":\"Adds OTA\"}"
+
+static void test_ota_discovery_and_initial_state(void) {
+    reset_component(true);
+    emit_connected();
+
+    assert(payload_contains_for_topic("update/presence-bacad4/firmware/config", "\"pl_inst\":\"install\""));
+    assert(payload_contains_for_topic("update/presence-bacad4/firmware/config", "\"dev_cla\":\"firmware\""));
+    assert(payload_contains_for_topic("update/presence-bacad4/firmware/config", "\"cmd_t\":\"" OTA_INSTALL "\""));
+    assert(subscribed_to("/cmd/ota/manifest"));
+    assert(subscribed_to("/cmd/ota/install"));
+    assert(last_payload_contains(OTA_STATE, "\"installed_version\":\"9.8.7\""));
+    assert(last_payload_contains(OTA_STATE, "\"latest_version\":\"9.8.7\""));
+    assert(last_payload_contains(OTA_STATE, "\"in_progress\":false"));
+
+    reset_component(false);
+    emit_connected();
+    const char *cleared = last_payload_for_topic("update/presence-bacad4/firmware/config");
+    assert(cleared && cleared[0] == '\0');
+    assert(!subscribed_to("/cmd/ota/"));
+    assert(!topic_contains(OTA_STATE));
+
+    printf("ok ota_discovery_and_initial_state\n");
+}
+
+static void test_ota_manifest_and_install_flow(void) {
+    reset_component(true);
+    emit_connected();
+
+    // The manifest is accepted even though it is retained.
+    emit_retained_data(OTA_MANIFEST, OTA_GOOD_MANIFEST);
+    assert(last_payload_contains(OTA_STATE, "\"latest_version\":\"9.9.0\""));
+    assert(last_payload_contains(OTA_STATE, "\"release_summary\":\"Adds OTA\""));
+
+    // A retained or wrong-payload install command never starts a download.
+    emit_retained_data(OTA_INSTALL, "install");
+    emit_data(OTA_INSTALL, "PRESS");
+    assert(g_ota_calls == 0);
+
+    emit_data(OTA_INSTALL, "install");
+    assert(g_ota_calls == 1);
+    assert(strcmp(g_ota_url, "http://192.168.1.62:8123/local/ota/x/fw.bin") == 0);
+    assert(strcmp(g_ota_sha, OTA_SHA) == 0);
+    assert(g_ota_size == 1245184);
+    assert(strcmp(g_ota_version, "9.9.0") == 0);
+    assert(last_payload_contains(OTA_STATE, "\"in_progress\":true"));
+    assert(last_payload_contains(OTA_STATE, "\"update_percentage\":0"));
+
+    // A second press while running is ignored.
+    emit_data(OTA_INSTALL, "install");
+    assert(g_ota_calls == 1);
+
+    ha_mqtt_publish_ota_progress(40);
+    assert(last_payload_contains(OTA_STATE, "\"update_percentage\":40"));
+
+    ha_mqtt_publish_ota_result(false, "sha256 mismatch");
+    assert(last_payload_contains(OTA_STATE, "\"in_progress\":false"));
+    assert(last_payload_contains(OTA_STATE, "\"update_percentage\":null"));
+    assert(last_payload_contains(OTA_STATE, "\"release_summary\":\"Last install failed: sha256 mismatch\""));
+
+    // Retry is allowed after a failure; failing to start is reported.
+    g_ota_start_ok = false;
+    emit_data(OTA_INSTALL, "install");
+    assert(g_ota_calls == 2);
+    assert(last_payload_contains(OTA_STATE, "Last install failed: could not start download"));
+    assert(last_payload_contains(OTA_STATE, "\"in_progress\":false"));
+
+    // Success keeps the entity busy at 100% until the reboot.
+    g_ota_start_ok = true;
+    emit_data(OTA_INSTALL, "install");
+    assert(g_ota_calls == 3);
+    ha_mqtt_publish_ota_result(true, "installed 9.9.0");
+    assert(last_payload_contains(OTA_STATE, "\"in_progress\":true"));
+    assert(last_payload_contains(OTA_STATE, "\"update_percentage\":100"));
+    assert(last_payload_contains("presence/presence-bacad4/status", "offline"));
+
+    // Clearing the retained manifest drops the pending update.
+    reset_component(true);
+    emit_connected();
+    emit_retained_data(OTA_MANIFEST, OTA_GOOD_MANIFEST);
+    emit_retained_data(OTA_MANIFEST, "");
+    assert(last_payload_contains(OTA_STATE, "\"latest_version\":\"9.8.7\""));
+    emit_data(OTA_INSTALL, "install");
+    assert(g_ota_calls == 0);
+
+    printf("ok ota_manifest_and_install_flow\n");
+}
+
+static void test_ota_rejects_bad_manifests(void) {
+    const char *bad[] = {
+        // short sha256
+        "{\"version\":\"9.9.0\",\"url\":\"http://h/fw.bin\",\"sha256\":\"0123\",\"size\":10}",
+        // non-hex sha256
+        "{\"version\":\"9.9.0\",\"url\":\"http://h/fw.bin\",\"sha256\":\"zz23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"size\":10}",
+        // unsupported scheme
+        "{\"version\":\"9.9.0\",\"url\":\"ftp://h/fw.bin\",\"sha256\":\"" OTA_SHA "\",\"size\":10}",
+        // quote in version
+        "{\"version\":\"9\\\"9\",\"url\":\"http://h/fw.bin\",\"sha256\":\"" OTA_SHA "\",\"size\":10}",
+        // size missing / zero / too large
+        "{\"version\":\"9.9.0\",\"url\":\"http://h/fw.bin\",\"sha256\":\"" OTA_SHA "\"}",
+        "{\"version\":\"9.9.0\",\"url\":\"http://h/fw.bin\",\"sha256\":\"" OTA_SHA "\",\"size\":0}",
+        "{\"version\":\"9.9.0\",\"url\":\"http://h/fw.bin\",\"sha256\":\"" OTA_SHA "\",\"size\":99999999}",
+        // not JSON
+        "install",
+    };
+
+    reset_component(true);
+    emit_connected();
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); ++i) {
+        emit_retained_data(OTA_MANIFEST, bad[i]);
+        assert(last_payload_contains(OTA_STATE, "\"latest_version\":\"9.8.7\""));
+    }
+    emit_data(OTA_INSTALL, "install");
+    assert(g_ota_calls == 0);
+
+    // A bad manifest does not erase a good one.
+    emit_retained_data(OTA_MANIFEST, OTA_GOOD_MANIFEST);
+    emit_retained_data(OTA_MANIFEST, bad[0]);
+    assert(last_payload_contains(OTA_STATE, "\"latest_version\":\"9.9.0\""));
+
+    // Same version as installed: nothing to do.
+    emit_retained_data(OTA_MANIFEST,
+        "{\"version\":\"9.8.7\",\"url\":\"http://h/fw.bin\",\"sha256\":\"" OTA_SHA "\",\"size\":10}");
+    emit_data(OTA_INSTALL, "install");
+    assert(g_ota_calls == 0);
+
+    printf("ok ota_rejects_bad_manifests\n");
+}
+
 int main(void) {
     test_discovery_without_command_topics();
     test_discovery_with_command_topics();
     test_reconnect_republishes_cached_state();
     test_command_validation_and_gating();
+    test_ld_gate_normalization_republishes_pair();
+    test_ota_discovery_and_initial_state();
+    test_ota_manifest_and_install_flow();
+    test_ota_rejects_bad_manifests();
     return 0;
 }

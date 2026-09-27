@@ -1,4 +1,9 @@
 # Name,   Type, SubType, Offset,   Size, Flags
+# Two OTA app slots (1.94 MB each) for over-the-air updates. nvs keeps its
+# original offset so persisted tuning survives the migration from the old
+# single-factory layout (that migration itself needs one USB flash).
 nvs,      data, nvs,     0x9000,   0x6000,
-phy_init, data, phy,     0xf000,   0x1000,
-factory,  app,  factory, 0x10000,  0x3f0000,
+otadata,  data, ota,     0xf000,   0x2000,
+phy_init, data, phy,     0x11000,  0x1000,
+ota_0,    app,  ota_0,   0x20000,  0x1f0000,
+ota_1,    app,  ota_1,   0x210000, 0x1f0000,

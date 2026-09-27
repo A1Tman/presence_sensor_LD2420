@@ -8,10 +8,12 @@ idf_component_register(
         esp_event 
         esp_netif 
         esp_timer
-        nvs_flash 
+        nvs_flash
+        esp_app_format
         mqtt 
         lwip
         ha_mqtt
+        ota_update
         ld2420
         nixy4__u8g2
 )

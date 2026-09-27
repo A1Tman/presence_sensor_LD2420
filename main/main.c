@@ -13,13 +13,15 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_err.h"
+#include "esp_app_desc.h"
 
 #include "ld2420.h"  // LD2420 library
 #include "ha_mqtt.h"
 #include "oled_status.h"
+#include "ota_update.h"
 #include "../config/secrets.h"
 
-#define DEVICE_VERSION "2.2.0"
+#define DEVICE_VERSION (esp_app_get_description()->version)  // PROJECT_VER in CMakeLists.txt
 
 // ==================== CONSTANTS ====================
 #define DIST_MIN_VALID_CM          10
@@ -34,6 +36,9 @@
 #define DELAY_MAX_MS               65535
 #define DETECT_LOG_DELTA_CM        5
 #define LOOP_STATUS_INTERVAL_ITERS 100   // ~10s at 100ms loop delay
+// A freshly installed OTA image must reach MQTT and see valid radar frames
+// within this window, otherwise the bootloader falls back to the old image.
+#define OTA_ROLLBACK_TIMEOUT_S     300
 #define RAW_PRESENCE_STALE_US      (2LL * 1000000LL)
 #define MOVEMENT_LOG_INTERVAL_US   (2LL * 1000000LL)
 #define APPLY_CONFIG_TASK_STACK    4096
@@ -436,6 +441,7 @@ static void apply_ld_config(void) {
                     ((int)applied.maintain_sensitivity != hold0_local);
 
     update_ld_state_from_snapshot(&applied);
+    ha_mqtt_publish_ld2420_config_states();
 
     if (!write_ok) {
         ESP_LOGW(TAG, "One or more LD2420 config writes reported errors");
@@ -454,6 +460,23 @@ static void apply_ld_config_task(void *arg) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         apply_ld_config();
     }
+}
+
+static bool start_ota_install(const char *url, const char *sha256_hex,
+                              uint32_t size, const char *version) {
+    const ota_update_request_t req = {
+        .url = url,
+        .sha256_hex = sha256_hex,
+        .size = size,
+        .version = version,
+    };
+    esp_err_t err = ota_update_start(&req, ha_mqtt_publish_ota_progress,
+                                     ha_mqtt_publish_ota_result);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "OTA start failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    return true;
 }
 
 static void request_apply_ld_config(void) {
@@ -563,6 +586,7 @@ static void start_mqtt(void) {
         .get_ld_maintain_sens = get_ld_maintain_sens,
         .set_ld_maintain_sens = set_ld_maintain_sens,
         .action_apply_config = request_apply_ld_config,
+        .action_ota_install = start_ota_install,
     };
 
     ha_mqtt_init(&cfg);
@@ -673,6 +697,9 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
+    // Arm the rollback guard before anything below can return early.
+    ota_update_init(OTA_ROLLBACK_TIMEOUT_S);
+
     // Restore persisted tunables before anything reads or publishes them.
     app_config_load();
 
@@ -782,6 +809,10 @@ void app_main(void) {
             xSemaphoreTake(s_state_mutex, portMAX_DELAY);
             presence_snapshot = s_current_presence;
             xSemaphoreGive(s_state_mutex);
+
+            if (sensor_data.isValid && ota_update_pending_verify() && ha_mqtt_is_connected()) {
+                ota_update_mark_valid();
+            }
 
             if (sensor_data.isValid) {
                 // We're getting valid packets

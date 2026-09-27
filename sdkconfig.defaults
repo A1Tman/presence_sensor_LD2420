@@ -2,8 +2,7 @@
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
 
-# Use a custom single-app partition table with a larger factory app slot.
-# This avoids running out of room while keeping the layout simple.
+# Custom partition table with two OTA app slots (see partitions.csv).
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
@@ -21,3 +20,18 @@ CONFIG_UART_ISR_IN_IRAM=y
 # Console over USB-Serial-JTAG (free GPIO20/21 from UART0)
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 # CONFIG_ESP_CONSOLE_NONE is not set
+
+# OTA: roll back to the previous image unless the new one confirms itself
+# healthy (MQTT connected + valid radar frames) within OTA_ROLLBACK_TIMEOUT_S.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# OTA: only accept update images signed with our RSA-3072 key. This is app
+# signature verification on update only - it does NOT enable Secure Boot and
+# burns no eFuses; USB flashing still accepts any image. The key lives outside
+# the repo; builds are signed automatically. Back the key up: losing it means
+# the next update has to be flashed over USB.
+CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT=y
+CONFIG_SECURE_SIGNED_APPS_RSA_SCHEME=y
+CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT=y
+CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES=y
+CONFIG_SECURE_BOOT_SIGNING_KEY="C:/Users/chris/.esp-keys/ld2420_ota_signing_key.pem"

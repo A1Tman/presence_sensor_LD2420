@@ -60,6 +60,14 @@ typedef struct {
     void (*action_reset_tuning)(void);
     void (*action_apply_config)(void);
 
+    // Optional firmware update (HA `update` entity). Requires
+    // command_topics_enabled. Called from the MQTT task when HA presses
+    // Install and a valid manifest has been received on cmd/ota/manifest.
+    // Must start the download asynchronously and return true if it did;
+    // report back via ha_mqtt_publish_ota_progress/_result.
+    bool (*action_ota_install)(const char *url, const char *sha256_hex,
+                               uint32_t size, const char *version);
+
     // Optional LD2420 tuning getters/setters
     int  (*get_ld_min_gate)(void);
     void (*set_ld_min_gate)(int);
@@ -106,6 +114,9 @@ void ha_mqtt_publish_rssi_now(void);
 /** Optionally force re-sending HA discovery configs (retained). */
 void ha_mqtt_resend_discovery(void);
 
+/** Publish retained LD2420 config states from the current getter callbacks. */
+void ha_mqtt_publish_ld2420_config_states(void);
+
 // Diagnostics helpers (optional)
 void ha_mqtt_diag_publish_out(int raw, int active, int present);
 void ha_mqtt_diag_publish_uart(int alive, int baud);
@@ -118,6 +129,15 @@ void ha_mqtt_publish_dir_away(int on);
 // The ESP application firmware version is advertised separately as device
 // sw_version from ha_mqtt_cfg_t.app_version.
 void ha_mqtt_publish_ld2420_fw_version(const char *version);
+
+/** Report firmware download progress (0..100) to the HA update entity. */
+void ha_mqtt_publish_ota_progress(int percent);
+
+/**
+ * Report the end of a firmware install. On failure, message is shown in the
+ * HA update dialog. On success the caller is expected to restart shortly.
+ */
+void ha_mqtt_publish_ota_result(bool ok, const char *message);
 
 #ifdef __cplusplus
 }

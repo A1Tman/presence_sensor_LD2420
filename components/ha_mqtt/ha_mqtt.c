@@ -5,6 +5,7 @@
 #include <ctype.h>
 #include <stdarg.h>
 
+#include "esp_chip_info.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -14,6 +15,7 @@
 #include "esp_wifi.h"
 #include "mqtt_client.h"
 #include "sensor_info.h"
+#include "cJSON.h"
 #include <strings.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -27,7 +29,7 @@ static ha_mqtt_cfg_t s_cfg = {
     .password      = NULL,
     .friendly_name = "Radar Sensor",
     .suggested_area= NULL,
-    .app_version   = "2.2.0",
+    .app_version   = NULL,
     .distance_supported = true,
     .broker_ca_cert_pem = NULL,
 };
@@ -41,6 +43,8 @@ static char s_broker_uri[128];
 
 /* Derived identifiers & topics */
 static char s_mac_str[18];              // AA:BB:CC:DD:EE:FF
+static char s_serial[13];               // AABBCCDDEEFF (HA device serial_number)
+static char s_hw_version[32];           // ESP32-C3 rev v0.4 (HA device hw_version)
 static char s_devid[32];                // presence-aabbcc
 static char s_entity_slug[32];          // presence_aabbcc
 static char s_topic_base[64];           // presence/presence-aabbcc
@@ -74,12 +78,31 @@ static char s_topic_cmd_restart[96];
 static char s_topic_cmd_resend_disc[96];
 static char s_topic_cmd_apply_cfg[96];
 
+/* Firmware update (HA update entity). The manifest is published retained by
+ * tools/ota_release.ps1; state is guarded by s_publish_lock. */
+static char s_topic_ota_state[96];
+static char s_topic_ota_install_cmd[96];
+static char s_topic_ota_manifest_cmd[96];
+typedef struct {
+    bool     valid;
+    char     version[32];
+    char     url[256];
+    char     sha256[65];
+    uint32_t size;
+    char     notes[128];
+} ota_manifest_t;
+static ota_manifest_t s_ota_manifest;
+static bool s_ota_in_progress = false;
+static int  s_ota_percent = -1;
+static char s_ota_last_error[64];
+
 /* Distance smoothing + movement zones */
 #define SMOOTH_BUFFER_SIZE 16
 #define ZONE_COUNT 3
 #define ZONE_DISTANCE_MAX_CM 600
 #define MQTT_RX_TOPIC_MAX_LEN   128
-#define MQTT_RX_PAYLOAD_MAX_LEN 256
+#define MQTT_RX_PAYLOAD_MAX_LEN 768     // OTA manifest is the largest command
+#define OTA_MAX_IMAGE_SIZE      (4U * 1024U * 1024U)
 static int  s_smooth_win = 5;
 static int  s_smooth_ring[SMOOTH_BUFFER_SIZE];
 static int  s_smooth_count = 0;
@@ -105,6 +128,7 @@ static char s_disc_button_restart[128];
 static char s_disc_button_resend_disc[128];
 static char s_disc_button_apply_cfg[128];
 static char s_disc_sensor_fwver[128];
+static char s_disc_update_fw[128];
 static bool s_restart_migration_done = false;
 static bool s_ld_hold00_cleanup_done = false;
 
@@ -431,10 +455,32 @@ static void set_zone_boundary(int index, bool set_min, int value) {
     }
 }
 
+static const char *chip_model_name(esp_chip_model_t model) {
+    switch (model) {
+        case CHIP_ESP32:   return "ESP32";
+        case CHIP_ESP32S2: return "ESP32-S2";
+        case CHIP_ESP32S3: return "ESP32-S3";
+        case CHIP_ESP32C3: return "ESP32-C3";
+        case CHIP_ESP32C2: return "ESP32-C2";
+        case CHIP_ESP32C6: return "ESP32-C6";
+        case CHIP_ESP32H2: return "ESP32-H2";
+        default:           return "ESP32";
+    }
+}
+
 static void derive_ids_and_topics(void) {
     uint8_t mac[6] = {0};
     esp_efuse_mac_get_default(mac);
     mac_to_str(mac, s_mac_str);
+    snprintf(s_serial, sizeof(s_serial), "%02X%02X%02X%02X%02X%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+    /* revision is encoded as MXX (major * 100 + minor) */
+    esp_chip_info_t chip = {0};
+    esp_chip_info(&chip);
+    snprintf(s_hw_version, sizeof(s_hw_version), "%s rev v%u.%u",
+             chip_model_name(chip.model),
+             (unsigned)(chip.revision / 100), (unsigned)(chip.revision % 100));
 
     /* short hex id (last 3 bytes) */
     snprintf(s_devid, sizeof(s_devid), "presence-%02x%02x%02x", mac[3], mac[4], mac[5]);
@@ -486,6 +532,9 @@ static void derive_ids_and_topics(void) {
     snprintf(s_topic_cmd_restart, sizeof(s_topic_cmd_restart), "%s/cmd/restart", s_topic_base);
     snprintf(s_topic_cmd_resend_disc, sizeof(s_topic_cmd_resend_disc), "%s/cmd/resend_discovery", s_topic_base);
     snprintf(s_topic_cmd_apply_cfg, sizeof(s_topic_cmd_apply_cfg), "%s/cmd/apply_config", s_topic_base);
+    snprintf(s_topic_ota_state, sizeof(s_topic_ota_state), "%s/ota/state", s_topic_base);
+    snprintf(s_topic_ota_install_cmd, sizeof(s_topic_ota_install_cmd), "%s/cmd/ota/install", s_topic_base);
+    snprintf(s_topic_ota_manifest_cmd, sizeof(s_topic_ota_manifest_cmd), "%s/cmd/ota/manifest", s_topic_base);
 
     /* Home Assistant discovery topics */
     snprintf(s_disc_bs_presence, sizeof(s_disc_bs_presence),
@@ -504,6 +553,8 @@ static void derive_ids_and_topics(void) {
              "%s/button/%s/resend_discovery/config", s_disc_prefix, s_devid);
     snprintf(s_disc_button_apply_cfg, sizeof(s_disc_button_apply_cfg),
              "%s/button/%s/apply_config/config", s_disc_prefix, s_devid);
+    snprintf(s_disc_update_fw, sizeof(s_disc_update_fw),
+             "%s/update/%s/firmware/config", s_disc_prefix, s_devid);
 }
 
 static bool should_downgrade_publish_qos(const char *topic) {
@@ -594,6 +645,7 @@ static void clear_command_discovery_configs(void) {
     pub(s_disc_button_restart, "", 0, 1);
     pub(s_disc_button_resend_disc, "", 0, 1);
     pub(s_disc_button_apply_cfg, "", 0, 1);
+    pub(s_disc_update_fw, "", 0, 1);
 }
 
 static void publish_discovery_all(void) {
@@ -609,7 +661,7 @@ static void publish_discovery_all(void) {
 
     json_escape(dev_name, dev_name_esc, sizeof(dev_name_esc));
     json_escape(dev_model, dev_model_esc, sizeof(dev_model_esc));
-    json_escape(s_cfg.app_version ? s_cfg.app_version : "1.0.0", app_ver_esc, sizeof(app_ver_esc));
+    json_escape(s_cfg.app_version ? s_cfg.app_version : "unknown", app_ver_esc, sizeof(app_ver_esc));
 
     if (s_cfg.suggested_area && s_cfg.suggested_area[0]) {
         json_escape(s_cfg.suggested_area, area_val_esc, sizeof(area_val_esc));
@@ -619,11 +671,13 @@ static void publish_discovery_all(void) {
     /* Device object */
     snprintf(dev_block, sizeof(dev_block),
         "\"dev\":{\"ids\":[\"%s\"],\"name\":\"%s\",\"mf\":\"Hi-Link + DIY\","
-        "\"mdl\":\"%s\",\"sw\":\"%s\","
+        "\"mdl\":\"%s\",\"sw\":\"%s\",\"hw\":\"%s\",\"sn\":\"%s\","
         "\"connections\":[[\"mac\",\"%s\"]]}%s",
         s_devid, dev_name_esc,
         dev_model_esc,
         app_ver_esc,
+        s_hw_version,
+        s_serial,
         s_mac_str,
         area
     );
@@ -911,6 +965,23 @@ static void publish_discovery_all(void) {
             json_appendf(payload, sizeof(payload), &len, "}");
             try_pub_disc(s_disc_button_apply_cfg, payload, len);
         }
+
+        /* Firmware update */
+        if (s_cfg.action_ota_install) {
+            char payload[1536]; int len=0;
+            json_appendf(payload, sizeof(payload), &len,
+                "{\"name\":\"Firmware\",\"uniq_id\":\"%s_firmware\","
+                "\"stat_t\":\"%s\",\"cmd_t\":\"%s\",\"pl_inst\":\"install\","
+                "\"dev_cla\":\"firmware\",\"ent_cat\":\"config\","
+                "\"avty_t\":\"%s\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",",
+                s_devid, s_topic_ota_state, s_topic_ota_install_cmd, s_topic_status);
+            append_default_entity_id(payload, sizeof(payload), &len, "update", "firmware");
+            json_appendf(payload, sizeof(payload), &len, "%s", dev_block);
+            json_appendf(payload, sizeof(payload), &len, "}");
+            try_pub_disc(s_disc_update_fw, payload, len);
+        } else {
+            pub(s_disc_update_fw, "", 0, 1);
+        }
     } else {
         clear_command_discovery_configs();
     }
@@ -1025,7 +1096,7 @@ static void publish_attrs_once(void) {
     char ver_esc[64];
     json_escape(s_cfg.device_model ? s_cfg.device_model : "HLK-LD2420 + ESP32",
                 model_esc, sizeof(model_esc));
-    json_escape(s_cfg.app_version ? s_cfg.app_version : "1.0.0",
+    json_escape(s_cfg.app_version ? s_cfg.app_version : "unknown",
                 ver_esc, sizeof(ver_esc));
 
     int len = 0;
@@ -1034,9 +1105,217 @@ static void publish_attrs_once(void) {
     json_appendf(json, sizeof(json), &len, "\"device_id\":\"%s\",", s_devid);
     json_appendf(json, sizeof(json), &len, "\"model\":\"%s\",", model_esc);
     json_appendf(json, sizeof(json), &len, "\"sw_version\":\"%s\",", ver_esc);
+    json_appendf(json, sizeof(json), &len, "\"hw_version\":\"%s\",", s_hw_version);
     json_appendf(json, sizeof(json), &len, "\"ip\":\"%s\"", ip_str);
     json_appendf(json, sizeof(json), &len, "}");
     pub(s_topic_attrs, json, 0, 0);
+}
+
+static void publish_ld2420_config_states(void) {
+    if (!s_cfg.command_topics_enabled) {
+        return;
+    }
+
+    char buf[16];
+
+    if (s_cfg.get_ld_min_gate && s_cfg.set_ld_min_gate) {
+        snprintf(buf, sizeof(buf), "%d", s_cfg.get_ld_min_gate());
+        pub(s_topic_cfg_ld_min_stat, buf, 1, 1);
+    }
+    if (s_cfg.get_ld_max_gate && s_cfg.set_ld_max_gate) {
+        snprintf(buf, sizeof(buf), "%d", s_cfg.get_ld_max_gate());
+        pub(s_topic_cfg_ld_max_stat, buf, 1, 1);
+    }
+    if (s_cfg.get_ld_delay_ms && s_cfg.set_ld_delay_ms) {
+        snprintf(buf, sizeof(buf), "%d", s_cfg.get_ld_delay_ms());
+        pub(s_topic_cfg_ld_delay_stat, buf, 1, 1);
+    }
+    if (s_cfg.get_ld_trigger_sens && s_cfg.set_ld_trigger_sens) {
+        snprintf(buf, sizeof(buf), "%d", s_cfg.get_ld_trigger_sens());
+        pub(s_topic_cfg_ld_trig0_stat, buf, 1, 1);
+    }
+    if (s_cfg.get_ld_maintain_sens && s_cfg.set_ld_maintain_sens) {
+        snprintf(buf, sizeof(buf), "%d", s_cfg.get_ld_maintain_sens());
+        pub(s_topic_cfg_ld_hold0_stat, buf, 1, 1);
+    }
+}
+
+/* ======================= Firmware update ======================= */
+static bool ota_enabled(void) {
+    return s_cfg.command_topics_enabled && s_cfg.action_ota_install;
+}
+
+static const char *installed_version(void) {
+    return s_cfg.app_version ? s_cfg.app_version : "unknown";
+}
+
+static void ota_lock(bool *taken) {
+    *taken = s_publish_lock && xSemaphoreTake(s_publish_lock, portMAX_DELAY) == pdTRUE;
+}
+
+static void ota_unlock(bool taken) {
+    if (taken) xSemaphoreGive(s_publish_lock);
+}
+
+static void publish_ota_state(void) {
+    if (!ota_enabled()) return;
+
+    ota_manifest_t m;
+    bool in_progress;
+    int percent;
+    char last_error[sizeof(s_ota_last_error)];
+    bool taken; ota_lock(&taken);
+    m = s_ota_manifest;
+    in_progress = s_ota_in_progress;
+    percent = s_ota_percent;
+    memcpy(last_error, s_ota_last_error, sizeof(last_error));
+    ota_unlock(taken);
+
+    char installed_esc[64];
+    char latest_esc[64];
+    char summary_esc[320];
+    json_escape(installed_version(), installed_esc, sizeof(installed_esc));
+    json_escape(m.valid ? m.version : installed_version(), latest_esc, sizeof(latest_esc));
+
+    char summary[160] = {0};
+    if (last_error[0]) {
+        snprintf(summary, sizeof(summary), "Last install failed: %s", last_error);
+    } else if (m.valid && m.notes[0]) {
+        snprintf(summary, sizeof(summary), "%s", m.notes);
+    }
+    json_escape(summary, summary_esc, sizeof(summary_esc));
+
+    char json[640];
+    int len = 0;
+    json_appendf(json, sizeof(json), &len,
+        "{\"installed_version\":\"%s\",\"latest_version\":\"%s\","
+        "\"title\":\"LD2420 presence firmware\",\"in_progress\":%s,",
+        installed_esc, latest_esc, in_progress ? "true" : "false");
+    if (in_progress && percent >= 0) {
+        json_appendf(json, sizeof(json), &len, "\"update_percentage\":%d,", percent);
+    } else {
+        json_appendf(json, sizeof(json), &len, "\"update_percentage\":null,");
+    }
+    if (summary[0]) {
+        json_appendf(json, sizeof(json), &len, "\"release_summary\":\"%s\"}", summary_esc);
+    } else {
+        json_appendf(json, sizeof(json), &len, "\"release_summary\":null}");
+    }
+    if (len < 0) {
+        ESP_LOGW(TAG, "OTA state payload truncated");
+        return;
+    }
+    pub(s_topic_ota_state, json, 1, 1);
+}
+
+static bool is_hex_string(const char *s, size_t want_len) {
+    if (!s || strlen(s) != want_len) return false;
+    for (size_t i = 0; i < want_len; ++i) {
+        if (!isxdigit((unsigned char)s[i])) return false;
+    }
+    return true;
+}
+
+static bool is_safe_version(const char *s) {
+    size_t n = s ? strlen(s) : 0;
+    if (n == 0 || n >= sizeof(s_ota_manifest.version)) return false;
+    for (size_t i = 0; i < n; ++i) {
+        unsigned char c = (unsigned char)s[i];
+        if (!isalnum(c) && c != '.' && c != '-' && c != '+' && c != '_') return false;
+    }
+    return true;
+}
+
+static bool is_safe_url(const char *s) {
+    size_t n = s ? strlen(s) : 0;
+    if (n == 0 || n >= sizeof(s_ota_manifest.url)) return false;
+    if (strncmp(s, "http://", 7) != 0 && strncmp(s, "https://", 8) != 0) return false;
+    for (size_t i = 0; i < n; ++i) {
+        unsigned char c = (unsigned char)s[i];
+        if (c <= ' ' || c >= 0x7f || c == '"' || c == '\\') return false;
+    }
+    return true;
+}
+
+// Manifest: {"version":"2.3.0","url":"http://...","sha256":"<64 hex>",
+//            "size":1043584,"notes":"optional"}. An empty (cleared retained)
+// payload forgets the manifest. Invalid manifests are ignored so a bad
+// publish cannot erase a good one.
+static void handle_ota_manifest(const char *payload, int payload_len) {
+    ota_manifest_t next = {0};
+
+    if (payload_len > 0) {
+        cJSON *root = cJSON_ParseWithLength(payload, (size_t)payload_len);
+        const cJSON *version = cJSON_GetObjectItemCaseSensitive(root, "version");
+        const cJSON *url = cJSON_GetObjectItemCaseSensitive(root, "url");
+        const cJSON *sha = cJSON_GetObjectItemCaseSensitive(root, "sha256");
+        const cJSON *size = cJSON_GetObjectItemCaseSensitive(root, "size");
+        const cJSON *notes = cJSON_GetObjectItemCaseSensitive(root, "notes");
+
+        bool ok = cJSON_IsObject(root) &&
+                  cJSON_IsString(version) && is_safe_version(version->valuestring) &&
+                  cJSON_IsString(url) && is_safe_url(url->valuestring) &&
+                  cJSON_IsString(sha) && is_hex_string(sha->valuestring, 64) &&
+                  cJSON_IsNumber(size) && size->valuedouble >= 1 &&
+                  size->valuedouble <= OTA_MAX_IMAGE_SIZE &&
+                  (notes == NULL || cJSON_IsString(notes));
+        if (ok) {
+            next.valid = true;
+            snprintf(next.version, sizeof(next.version), "%s", version->valuestring);
+            snprintf(next.url, sizeof(next.url), "%s", url->valuestring);
+            snprintf(next.sha256, sizeof(next.sha256), "%s", sha->valuestring);
+            next.size = (uint32_t)size->valuedouble;
+            if (notes) snprintf(next.notes, sizeof(next.notes), "%s", notes->valuestring);
+        }
+        cJSON_Delete(root);
+
+        if (!ok) {
+            ESP_LOGW(TAG, "Ignoring invalid OTA manifest");
+            return;
+        }
+        ESP_LOGI(TAG, "OTA manifest: version %s (%" PRIu32 " bytes)", next.version, next.size);
+    } else {
+        ESP_LOGI(TAG, "OTA manifest cleared");
+    }
+
+    bool taken; ota_lock(&taken);
+    s_ota_manifest = next;
+    s_ota_last_error[0] = '\0';
+    ota_unlock(taken);
+    publish_ota_state();
+}
+
+static void handle_ota_install(void) {
+    ota_manifest_t m;
+    bool busy;
+    bool taken; ota_lock(&taken);
+    m = s_ota_manifest;
+    busy = s_ota_in_progress;
+    if (!busy && m.valid && strcmp(m.version, installed_version()) != 0) {
+        s_ota_in_progress = true;
+        s_ota_percent = 0;
+        s_ota_last_error[0] = '\0';
+    }
+    ota_unlock(taken);
+
+    if (busy) {
+        ESP_LOGW(TAG, "OTA install ignored: already in progress");
+        return;
+    }
+    if (!m.valid) {
+        ESP_LOGW(TAG, "OTA install ignored: no manifest");
+        return;
+    }
+    if (strcmp(m.version, installed_version()) == 0) {
+        ESP_LOGW(TAG, "OTA install ignored: %s already installed", m.version);
+        return;
+    }
+
+    ESP_LOGW(TAG, "OTA install requested: %s -> %s", installed_version(), m.version);
+    publish_ota_state();
+    if (!s_cfg.action_ota_install(m.url, m.sha256, m.size, m.version)) {
+        ha_mqtt_publish_ota_result(false, "could not start download");
+    }
 }
 
 /* ======================= MQTT event handling ======================= */
@@ -1076,34 +1355,31 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 /* Subscribe LD2420 tuning commands and publish initial states */
                 if (s_cfg.get_ld_min_gate && s_cfg.set_ld_min_gate) {
                     esp_mqtt_client_subscribe(s_client, s_topic_cfg_ld_min_cmd, 1);
-                    char buf[16]; snprintf(buf, sizeof(buf), "%d", s_cfg.get_ld_min_gate());
-                    pub(s_topic_cfg_ld_min_stat, buf, 1, 1);
                 }
                 if (s_cfg.get_ld_max_gate && s_cfg.set_ld_max_gate) {
                     esp_mqtt_client_subscribe(s_client, s_topic_cfg_ld_max_cmd, 1);
-                    char buf[16]; snprintf(buf, sizeof(buf), "%d", s_cfg.get_ld_max_gate());
-                    pub(s_topic_cfg_ld_max_stat, buf, 1, 1);
                 }
                 if (s_cfg.get_ld_delay_ms && s_cfg.set_ld_delay_ms) {
                     esp_mqtt_client_subscribe(s_client, s_topic_cfg_ld_delay_cmd, 1);
-                    char buf[16]; snprintf(buf, sizeof(buf), "%d", s_cfg.get_ld_delay_ms());
-                    pub(s_topic_cfg_ld_delay_stat, buf, 1, 1);
                 }
                 if (s_cfg.get_ld_trigger_sens && s_cfg.set_ld_trigger_sens) {
                     esp_mqtt_client_subscribe(s_client, s_topic_cfg_ld_trig0_cmd, 1);
-                    char buf[16]; snprintf(buf, sizeof(buf), "%d", s_cfg.get_ld_trigger_sens());
-                    pub(s_topic_cfg_ld_trig0_stat, buf, 1, 1);
                 }
                 if (s_cfg.get_ld_maintain_sens && s_cfg.set_ld_maintain_sens) {
                     esp_mqtt_client_subscribe(s_client, s_topic_cfg_ld_hold0_cmd, 1);
-                    char buf[16]; snprintf(buf, sizeof(buf), "%d", s_cfg.get_ld_maintain_sens());
-                    pub(s_topic_cfg_ld_hold0_stat, buf, 1, 1);
                 }
+                publish_ld2420_config_states();
 
                 /* Action buttons */
                 esp_mqtt_client_subscribe(s_client, s_topic_cmd_restart, 1);
                 esp_mqtt_client_subscribe(s_client, s_topic_cmd_resend_disc, 1);
                 esp_mqtt_client_subscribe(s_client, s_topic_cmd_apply_cfg, 1);
+
+                if (s_cfg.action_ota_install) {
+                    esp_mqtt_client_subscribe(s_client, s_topic_ota_manifest_cmd, 1);
+                    esp_mqtt_client_subscribe(s_client, s_topic_ota_install_cmd, 1);
+                    publish_ota_state();
+                }
 
                 /* Zone and smoothing defaults */
                 if (s_publish_lock && xSemaphoreTake(s_publish_lock, portMAX_DELAY) == pdTRUE) {
@@ -1185,6 +1461,16 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     break;
                 }
 
+                // The OTA manifest is the one intentionally retained input: it
+                // describes the latest release and is only acted on when HA
+                // sends a separate, non-retained install command.
+                if (s_cfg.action_ota_install &&
+                    tlen == (int)strlen(s_topic_ota_manifest_cmd) &&
+                    strncmp(t, s_topic_ota_manifest_cmd, tlen) == 0) {
+                    handle_ota_manifest(payload, payload_len);
+                    break;
+                }
+
                 // Reject retained command messages. The device only subscribes to
                 // /cmd/* topics, so any retained inbound is a replay risk: a
                 // retained PRESS on cmd/restart would re-trigger restart on every
@@ -1233,8 +1519,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     if (s_cfg.set_ld_min_gate) {
                         int v; if (safe_atoi(payload, payload_len, &v, 0, 15)) {
                             s_cfg.set_ld_min_gate(v);
-                            char buf[16]; snprintf(buf, sizeof(buf), "%d", s_cfg.get_ld_min_gate ? s_cfg.get_ld_min_gate() : v);
-                            pub(s_topic_cfg_ld_min_stat, buf, 1, 1);
+                            publish_ld2420_config_states();
                             ESP_LOGI(TAG, "Set LD2420 min_gate: %d", v);
                         } else {
                             ESP_LOGW(TAG, "Invalid LD2420 min_gate value");
@@ -1244,8 +1529,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     if (s_cfg.set_ld_max_gate) {
                         int v; if (safe_atoi(payload, payload_len, &v, 0, 15)) {
                             s_cfg.set_ld_max_gate(v);
-                            char buf[16]; snprintf(buf, sizeof(buf), "%d", s_cfg.get_ld_max_gate ? s_cfg.get_ld_max_gate() : v);
-                            pub(s_topic_cfg_ld_max_stat, buf, 1, 1);
+                            publish_ld2420_config_states();
                             ESP_LOGI(TAG, "Set LD2420 max_gate: %d", v);
                         } else {
                             ESP_LOGW(TAG, "Invalid LD2420 max_gate value");
@@ -1255,8 +1539,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     if (s_cfg.set_ld_delay_ms) {
                         int v; if (safe_atoi(payload, payload_len, &v, 0, 65535)) {
                             s_cfg.set_ld_delay_ms(v);
-                            char buf[16]; snprintf(buf, sizeof(buf), "%d", s_cfg.get_ld_delay_ms ? s_cfg.get_ld_delay_ms() : v);
-                            pub(s_topic_cfg_ld_delay_stat, buf, 1, 1);
+                            publish_ld2420_config_states();
                             ESP_LOGI(TAG, "Set LD2420 delay_time: %d ms", v);
                         } else {
                             ESP_LOGW(TAG, "Invalid LD2420 delay_time value");
@@ -1266,8 +1549,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     if (s_cfg.set_ld_trigger_sens) {
                         int v; if (safe_atoi(payload, payload_len, &v, 0, 65535)) {
                             s_cfg.set_ld_trigger_sens(v);
-                            char buf[16]; snprintf(buf, sizeof(buf), "%d", s_cfg.get_ld_trigger_sens ? s_cfg.get_ld_trigger_sens() : v);
-                            pub(s_topic_cfg_ld_trig0_stat, buf, 1, 1);
+                            publish_ld2420_config_states();
                             ESP_LOGI(TAG, "Set LD2420 trigger_sens: %d", v);
                         } else {
                             ESP_LOGW(TAG, "Invalid LD2420 trigger_sens value");
@@ -1277,8 +1559,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     if (s_cfg.set_ld_maintain_sens) {
                         int v; if (safe_atoi(payload, payload_len, &v, 0, 65535)) {
                             s_cfg.set_ld_maintain_sens(v);
-                            char buf[16]; snprintf(buf, sizeof(buf), "%d", s_cfg.get_ld_maintain_sens ? s_cfg.get_ld_maintain_sens() : v);
-                            pub(s_topic_cfg_ld_hold0_stat, buf, 1, 1);
+                            publish_ld2420_config_states();
                             ESP_LOGI(TAG, "Set LD2420 maintain_sens: %d", v);
                         } else {
                             ESP_LOGW(TAG, "Invalid LD2420 maintain_sens value");
@@ -1361,6 +1642,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                             if (s_cfg.action_apply_config) s_cfg.action_apply_config();
                         }
                     }
+                } else if (s_cfg.action_ota_install &&
+                           tlen == (int)strlen(s_topic_ota_install_cmd) &&
+                           strncmp(t, s_topic_ota_install_cmd, tlen) == 0) {
+                    if (payload_len == 7 && strncmp(payload, "install", 7) == 0) {
+                        handle_ota_install();
+                    }
                 }
             }
             break;
@@ -1400,6 +1687,10 @@ void ha_mqtt_init(const ha_mqtt_cfg_t *cfg) {
     }
     
     derive_ids_and_topics();
+    memset(&s_ota_manifest, 0, sizeof(s_ota_manifest));
+    s_ota_in_progress = false;
+    s_ota_percent = -1;
+    s_ota_last_error[0] = '\0';
     s_boot_us = esp_timer_get_time();
     s_last_diag_us = 0;
     
@@ -1588,6 +1879,11 @@ void ha_mqtt_resend_discovery(void) {
     publish_attrs_once();
 }
 
+void ha_mqtt_publish_ld2420_config_states(void) {
+    if (!is_connected_snapshot()) return;
+    publish_ld2420_config_states();
+}
+
 void ha_mqtt_publish_ld2420_fw_version(const char *version) {
     const char *incoming = (version && version[0]) ? version : "unknown";
     bool lock_taken = false;
@@ -1619,6 +1915,38 @@ void ha_mqtt_publish_ld2420_fw_version(const char *version) {
 
     const char *to_send = (s_have_ld2420_fw_version && s_last_ld2420_fw_version[0]) ? s_last_ld2420_fw_version : incoming;
     pub(s_topic_fwver, to_send, 1, 1);
+}
+
+void ha_mqtt_publish_ota_progress(int percent) {
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    bool taken; ota_lock(&taken);
+    s_ota_in_progress = true;
+    s_ota_percent = percent;
+    ota_unlock(taken);
+    publish_ota_state();
+}
+
+void ha_mqtt_publish_ota_result(bool ok, const char *message) {
+    bool taken; ota_lock(&taken);
+    if (ok) {
+        // Stay "in progress" at 100% until the restart; the new image then
+        // reports its own installed_version.
+        s_ota_in_progress = true;
+        s_ota_percent = 100;
+        s_ota_last_error[0] = '\0';
+    } else {
+        s_ota_in_progress = false;
+        s_ota_percent = -1;
+        snprintf(s_ota_last_error, sizeof(s_ota_last_error), "%s",
+                 (message && message[0]) ? message : "unknown error");
+    }
+    ota_unlock(taken);
+    publish_ota_state();
+    if (ok) {
+        // Restart follows; mark offline now instead of waiting for the LWT.
+        pub(s_topic_status, "offline", 1, 1);
+    }
 }
 
 /* Diagnostic hooks (no-op by default) */

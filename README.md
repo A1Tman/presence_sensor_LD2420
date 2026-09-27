@@ -43,6 +43,7 @@ This firmware publishes HA discovery. After boot you’ll see a device with:
 - `number` (config): Movement Threshold (cm), Presence Hold (s)
 - `number` (LD2420): Min/Max Gate, Response Delay (ms), Trigger Level, Tracking Level
 - `button`: Apply Config (config), Restart (diagnostic), Resend Discovery (diagnostic)
+- `update` (config): Firmware - shows "Update available" and installs OTA releases
 
 The onboard 72x40 OLED mirrors key local state without needing Home Assistant:
 
@@ -62,6 +63,26 @@ Base topic: `presence/<device-id>`
 - RSSI: `/rssi`, Uptime: `/uptime_s`
 - Zones: `/movement/near_range`, `/mid_range`, `/far_range` (`ON`/`OFF`)
 - Numbers publish retained states under `/cfg/...` and receive commands under `/cmd/...`
+- OTA: state `/ota/state` (JSON for the HA update entity); retained manifest in `/cmd/ota/manifest`; install command `/cmd/ota/install`
+
+## OTA updates
+
+The version lives in one place: `PROJECT_VER` in `CMakeLists.txt`. It is reported to HA as the device firmware version.
+
+Flash layout: two 1.94 MB app slots (`ota_0`/`ota_1`, see `partitions.csv`). Moving from the old single-factory layout needs **one USB flash** (`idf.py flash`); NVS settings are kept.
+
+Release flow:
+
+1. Bump `PROJECT_VER`, then `idf.py build` (the image is signed automatically).
+2. `./tools/ota_release.ps1 -Notes "what changed"` copies the image to HA (`/config/www/ota/<device>/<random>/`) and publishes a retained manifest (version, URL, SHA-256, size) over MQTT.
+3. In HA, press **Install** on the device's *Firmware* entity. The device downloads the image, checks size + SHA-256 + signature + version, switches slots and reboots.
+4. After it reports the new version: `./tools/ota_release.ps1 -Clean` (removes the hosted file, clears the manifest).
+
+Safety nets:
+
+- **Signed images only** (`CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT`, RSA-3072). OTA images must be signed with the private key at `CONFIG_SECURE_BOOT_SIGNING_KEY` (kept outside the repo; back it up). The public key is `tools/ota_signing_pubkey.pem`. This is not Secure Boot: no eFuses are burned and USB flashing accepts any image.
+- **Automatic rollback**: a new image must connect to MQTT and receive valid radar frames within 5 minutes (`OTA_ROLLBACK_TIMEOUT_S`), or it reboots into the previous image. Crashes before that also roll back.
+- The release script needs an MQTT login (default `ota_release`) that can publish `presence/+/cmd/ota/manifest`; the password comes from `LD2420_OTA_MQTT_PASSWORD` or a prompt.
 
 ## LD2420 Protocol (short version)
 
@@ -106,4 +127,6 @@ Upload (“energy”) data:
 
 - `components/ld2420`: UART driver and protocol helpers (enter/exit config, read/write params, read version)
 - `components/ha_mqtt`: MQTT + HA discovery and entities
+- `components/ota_update`: OTA download/verify/flash and rollback guard
+- `tools/ota_release.ps1`: publish a build as an OTA update via Home Assistant
 - `main`: app wiring, logic, and MQTT integration
