@@ -128,6 +128,8 @@ static int  s_last_distance_mm = -1;
 static bool s_have_ld2420_fw_version = false;
 static char s_last_ld2420_fw_version[64] = {0};
 static int64_t s_boot_epoch_s = 0;      // 0 = unknown (no wall clock yet)
+static int  s_radar_fault = -1;         // -1 unknown, 0 ok, 1 no data
+static char s_topic_radar_fault[96];
 
 /* Uptime ticker */
 static int64_t s_last_diag_us = 0;
@@ -490,6 +492,7 @@ static void derive_ids_and_topics(void) {
     snprintf(s_topic_attrs, sizeof(s_topic_attrs), "%s/attributes", s_topic_base);
     snprintf(s_topic_rssi, sizeof(s_topic_rssi), "%s/rssi", s_topic_base);
     snprintf(s_topic_boot_time, sizeof(s_topic_boot_time), "%s/last_restart", s_topic_base);
+    snprintf(s_topic_radar_fault, sizeof(s_topic_radar_fault), "%s/radar_fault", s_topic_base);
     snprintf(s_topic_fwver, sizeof(s_topic_fwver), "%s/ld2420/fw_version", s_topic_base);
     
     snprintf(s_topic_cfg_movement_thresh_stat, sizeof(s_topic_cfg_movement_thresh_stat), "%s/cfg/movement_threshold_cm", s_topic_base);
@@ -826,6 +829,11 @@ static void publish_discovery_all(void) {
         "\"name\":\"Last restart\",\"uniq_id\":\"%s_last_restart\",\"stat_t\":\"%s\","
         "\"dev_cla\":\"timestamp\",\"ic\":\"mdi:restart\",\"ent_cat\":\"diagnostic\"," AVAIL_FIELDS,
         s_devid, s_topic_boot_time, s_topic_status);
+    publish_entity("binary_sensor", "radar", "radar", dev_block,
+        "\"name\":\"Radar\",\"uniq_id\":\"%s_radar\",\"stat_t\":\"%s\","
+        "\"dev_cla\":\"problem\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\","
+        "\"ic\":\"mdi:radar\",\"ent_cat\":\"diagnostic\"," AVAIL_FIELDS,
+        s_devid, s_topic_radar_fault, s_topic_status);
     publish_entity("sensor", "radar_firmware", "radar_firmware", dev_block,
         "\"name\":\"Radar firmware\",\"uniq_id\":\"%s_radar_firmware\",\"stat_t\":\"%s\","
         "\"ic\":\"mdi:chip\",\"ent_cat\":\"diagnostic\"," AVAIL_FIELDS,
@@ -987,10 +995,15 @@ static bool parse_decimetres(const char *payload, int len, int *out_dm) {
     return true;
 }
 
+static bool ld_config_valid(void) {
+    return !s_cfg.ld_config_valid || s_cfg.ld_config_valid();
+}
+
 static const char *const SENSITIVITY_NAMES[] = {"Low", "Medium", "High"};
 
 static void publish_sensitivity_state(void) {
     if (!s_cfg.command_topics_enabled || !s_cfg.get_sensitivity || !s_cfg.set_sensitivity) return;
+    if (!ld_config_valid()) return;
     int level = s_cfg.get_sensitivity();
     const char *name = (level >= HA_MQTT_SENSITIVITY_LOW && level <= HA_MQTT_SENSITIVITY_HIGH)
                            ? SENSITIVITY_NAMES[level] : "Custom";
@@ -998,7 +1011,7 @@ static void publish_sensitivity_state(void) {
 }
 
 static void publish_ld2420_config_states(void) {
-    if (!s_cfg.command_topics_enabled) {
+    if (!s_cfg.command_topics_enabled || !ld_config_valid()) {
         return;
     }
 
@@ -1036,6 +1049,14 @@ static void format_iso8601_utc(int64_t epoch, char *out, size_t out_size) {
     if (m <= 2) y += 1;
     snprintf(out, out_size, "%04d-%02d-%02dT%02d:%02d:%02d+00:00",
              (int)y, (int)m, (int)d, (int)(secs / 3600), (int)(secs % 3600 / 60), (int)(secs % 60));
+}
+
+static void publish_radar_fault(void) {
+    bool taken = s_publish_lock && xSemaphoreTake(s_publish_lock, portMAX_DELAY) == pdTRUE;
+    int fault = s_radar_fault;
+    if (taken) xSemaphoreGive(s_publish_lock);
+    if (fault < 0) return;
+    pub(s_topic_radar_fault, fault ? "ON" : "OFF", 1, 1);
 }
 
 static void publish_boot_time(void) {
@@ -1341,6 +1362,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 ha_mqtt_publish_ld2420_fw_version(fw_buf);
             }
             publish_boot_time();
+            publish_radar_fault();
             break;
 
         case MQTT_EVENT_DISCONNECTED:
@@ -1421,7 +1443,14 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                         ESP_LOGW(TAG, "Invalid presence timeout value");
                     }
                     
-                /* LD2420 tuning. Distances arrive in metres, 70 cm per gate. */
+                /* LD2420 tuning. Distances arrive in metres, 70 cm per gate.
+                 * Ignored until the radar's own settings are known. */
+                } else if (!ld_config_valid() &&
+                           ((tlen == (int)strlen(s_topic_cfg_ld_min_cmd) && strncmp(t, s_topic_cfg_ld_min_cmd, tlen) == 0) ||
+                            (tlen == (int)strlen(s_topic_cfg_ld_max_cmd) && strncmp(t, s_topic_cfg_ld_max_cmd, tlen) == 0) ||
+                            (tlen == (int)strlen(s_topic_cfg_ld_delay_cmd) && strncmp(t, s_topic_cfg_ld_delay_cmd, tlen) == 0) ||
+                            (tlen == (int)strlen(s_topic_cfg_sens_cmd) && strncmp(t, s_topic_cfg_sens_cmd, tlen) == 0))) {
+                    ESP_LOGW(TAG, "Ignoring radar setting: radar settings not read yet");
                 } else if (tlen == (int)strlen(s_topic_cfg_ld_min_cmd) && strncmp(t, s_topic_cfg_ld_min_cmd, tlen) == 0) {
                     int dm;
                     if (s_cfg.set_ld_min_gate && parse_decimetres(payload, payload_len, &dm) &&
@@ -1583,6 +1612,7 @@ void ha_mqtt_init(const ha_mqtt_cfg_t *cfg) {
     derive_ids_and_topics();
     load_persisted_settings();
     s_boot_epoch_s = 0;
+    s_radar_fault = -1;
     memset(&s_ota_manifest, 0, sizeof(s_ota_manifest));
     s_ota_in_progress = false;
     s_ota_percent = -1;
@@ -1863,6 +1893,17 @@ void ha_mqtt_publish_boot_time(int64_t boot_epoch_s) {
     s_boot_epoch_s = boot_epoch_s;
     if (taken) xSemaphoreGive(s_publish_lock);
     if (is_connected_snapshot()) publish_boot_time();
+}
+
+void ha_mqtt_publish_radar_fault(bool fault) {
+    bool taken = s_publish_lock && xSemaphoreTake(s_publish_lock, portMAX_DELAY) == pdTRUE;
+    s_radar_fault = fault ? 1 : 0;
+    if (taken) xSemaphoreGive(s_publish_lock);
+    if (is_connected_snapshot()) publish_radar_fault();
+}
+
+void ha_mqtt_tick(void) {
+    if (is_connected_snapshot()) publish_periodic_diag_if_due();
 }
 
 void ha_mqtt_publish_sensitivity_state(void) {

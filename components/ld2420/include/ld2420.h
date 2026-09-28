@@ -107,6 +107,9 @@ esp_err_t ld2420_read_firmware_version(ld2420_t* sensor, char *out, size_t out_s
 esp_err_t ld2420_enter_command_mode(ld2420_t* sensor);
 esp_err_t ld2420_exit_command_mode(ld2420_t* sensor);
 esp_err_t ld2420_restart(ld2420_t* sensor);
+// Restart a radar that stopped streaming and make sure it outputs Energy
+// Mode frames again. Blocks ~3 s. Caller should hold ld2420_lock().
+esp_err_t ld2420_recover(ld2420_t* sensor);
 
 // Write single parameter (low-level): param_id as in protocol tables
 esp_err_t ld2420_set_param(ld2420_t* sensor, uint16_t param_id, uint32_t value);

@@ -90,6 +90,11 @@ typedef struct {
 
     // Optional persistence for settings kept on the ESP32 (zones, smoothing).
     // load returns false when the key is absent.
+    // Optional: false while the LD2420 settings could not be read from the
+    // radar. Its settings are then neither published nor accepted, so
+    // defaults never reach HA or get written back to the radar.
+    bool (*ld_config_valid)(void);
+
     bool (*load_setting)(const char *key, int *out);
     void (*save_setting)(const char *key, int value);
 
@@ -161,6 +166,15 @@ void ha_mqtt_publish_boot_time(int64_t boot_epoch_s);
 
 /** Publish the current sensitivity preset (e.g. after thresholds change). */
 void ha_mqtt_publish_sensitivity_state(void);
+
+/** Radar health for the HA "Radar" problem sensor (true = no data). */
+void ha_mqtt_publish_radar_fault(bool fault);
+
+/**
+ * Call regularly from the main loop: sends the Wi-Fi signal and the
+ * availability heartbeat even when the radar produces no data.
+ */
+void ha_mqtt_tick(void);
 
 #ifdef __cplusplus
 }

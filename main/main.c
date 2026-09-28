@@ -54,6 +54,10 @@
 #define APPLY_CONFIG_TASK_PRIO     3
 // Radar settings changed from HA are written once they stop changing.
 #define APPLY_DEBOUNCE_US          (2LL * 1000000LL)
+// Radar watchdog: no valid frame for this long means the radar has stopped
+// streaming (e.g. stuck in command mode after a brown-out); restart it.
+#define RADAR_SILENT_US            (30LL * 1000000LL)
+#define RADAR_RETRY_US             (120LL * 1000000LL)
 // Any wall-clock time before this means SNTP has not synced yet.
 #define MIN_VALID_EPOCH_S          1700000000LL
 
@@ -135,6 +139,8 @@ static int s_ld_trigger_sens = 200;  // 0..65535
 static int s_ld_maintain_sens = 150; // 0..65535
 static int s_ld_sensitivity = -1;         // HA_MQTT_SENSITIVITY_*, -1 = custom/unknown
 static bool s_ld_sensitivity_pending = false; // preset chosen in HA, not yet written
+static bool s_ld_config_synced = false;  // radar settings read successfully
+static int64_t s_last_radar_frame_us = 0; // main task only
 
 static bool detect_movement(int distance_cm) {
     // Caller must hold s_state_mutex
@@ -233,6 +239,7 @@ void onStateChange(LD2420_DetectionState oldState, LD2420_DetectionState newStat
 // Callback for data updates (called frequently)
 void onDataUpdate(ld2420_data_t data) {
     if (s_sensor == NULL) return;
+    if (data.isValid) s_last_radar_frame_us = esp_timer_get_time();
 
     update_presence_state(data.state == LD2420_DETECTION_ACTIVE, data.distance);
 
@@ -443,14 +450,29 @@ static esp_err_t sync_ld_config_from_sensor(void) {
 
     update_ld_state_from_snapshot(&snapshot);
     sync_ld_sensitivity_from_sensor();
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_ld_config_synced = true;
+    xSemaphoreGive(s_state_mutex);
     ESP_LOGI(TAG, "Synced LD2420 config: min_gate=%d max_gate=%d delay_s=%d trig0=%" PRIu32 " maintain0=%" PRIu32,
              snapshot.min_gate, snapshot.max_gate, snapshot.delay_s,
              snapshot.trigger_sensitivity, snapshot.maintain_sensitivity);
     return ESP_OK;
 }
 
+static bool ld_config_valid(void) {
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    bool v = s_ld_config_synced;
+    xSemaphoreGive(s_state_mutex);
+    return v;
+}
+
 static void apply_ld_config(void) {
     if (!s_sensor) return;
+    if (!ld_config_valid()) {
+        // Writing now would push firmware defaults over the radar's settings.
+        ESP_LOGW(TAG, "Skipping LD2420 apply: radar settings not read yet");
+        return;
+    }
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     int min_gate = s_ld_min_gate;
@@ -701,6 +723,7 @@ static void start_mqtt(void) {
         .set_ld_delay_s = set_ld_delay_s,
         .get_sensitivity = get_sensitivity,
         .set_sensitivity = set_sensitivity,
+        .ld_config_valid = ld_config_valid,
         .load_setting = app_setting_load,
         .save_setting = app_setting_save,
         .action_ota_install = start_ota_install,
@@ -1004,6 +1027,39 @@ void app_main(void) {
                     ESP_LOGW(TAG, "  2. Check if TX/RX are swapped");
                     ESP_LOGW(TAG, "  3. OT2 pin %s working for basic detection",
                              ot2_state ? "IS" : "might be");
+                }
+            }
+        }
+
+        // Heartbeat (signal + availability) independent of radar data.
+        ha_mqtt_tick();
+
+        // Radar watchdog: restart a radar that stopped streaming.
+        {
+            static int64_t last_recovery_us = 0;
+            static int radar_state = -1;  // -1 unknown, 0 ok, 1 silent
+            int64_t now_us = esp_timer_get_time();
+            int silent = ((now_us - s_last_radar_frame_us) > RADAR_SILENT_US) ? 1 : 0;
+            if (silent != radar_state) {
+                if (silent) {
+                    ESP_LOGW(TAG, "No radar data for %lld s",
+                             (long long)((now_us - s_last_radar_frame_us) / 1000000LL));
+                } else if (radar_state == 1) {
+                    ESP_LOGI(TAG, "Radar data is back");
+                    last_recovery_us = 0;
+                    if (!ld_config_valid() && sync_ld_config_from_sensor() == ESP_OK) {
+                        ha_mqtt_publish_ld2420_config_states();
+                    }
+                }
+                radar_state = silent;
+                ha_mqtt_publish_radar_fault(silent);
+            }
+            if (silent && (last_recovery_us == 0 || now_us - last_recovery_us > RADAR_RETRY_US)) {
+                last_recovery_us = now_us;
+                if (ld2420_lock(s_sensor, pdMS_TO_TICKS(1000))) {
+                    esp_err_t rerr = ld2420_recover(s_sensor);
+                    ld2420_unlock(s_sensor);
+                    ESP_LOGW(TAG, "Radar recovery %s", rerr == ESP_OK ? "done" : esp_err_to_name(rerr));
                 }
             }
         }

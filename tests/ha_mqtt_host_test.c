@@ -41,6 +41,7 @@ static int g_ld_min_gate = 0;
 static int g_ld_max_gate = 12;
 static int g_ld_delay_s = 30;
 static int g_sensitivity = 1;
+static bool g_ld_config_valid = true;
 
 #define MAX_SETTINGS 16
 static char g_setting_keys[MAX_SETTINGS][16];
@@ -116,6 +117,7 @@ static void set_ld_max_gate(int value) {
 }
 static int get_ld_delay_s(void) { return g_ld_delay_s; }
 static void set_ld_delay_s(int value) { g_ld_delay_s = value; }
+static bool ld_config_valid_cb(void) { return g_ld_config_valid; }
 static int get_sensitivity(void) { return g_sensitivity; }
 static void set_sensitivity(int level) { g_sensitivity = level; }
 
@@ -314,6 +316,7 @@ static ha_mqtt_cfg_t base_config(bool commands_enabled) {
         .set_ld_max_gate = set_ld_max_gate,
         .get_ld_delay_s = get_ld_delay_s,
         .set_ld_delay_s = set_ld_delay_s,
+        .ld_config_valid = ld_config_valid_cb,
         .get_sensitivity = get_sensitivity,
         .set_sensitivity = set_sensitivity,
         .load_setting = load_setting,
@@ -750,6 +753,52 @@ static void test_ota_pauses_telemetry(void) {
     printf("ok ota_pauses_telemetry\n");
 }
 
+static void test_radar_health_and_heartbeat(void) {
+    reset_component(true);
+    emit_connected();
+    assert(payload_contains_for_topic(DISC("binary_sensor", "radar"), "\"dev_cla\":\"problem\""));
+    assert(!topic_contains("presence/presence-bacad4/radar_fault"));  // unknown until reported
+
+    ha_mqtt_publish_radar_fault(true);
+    assert(last_payload_contains("presence/presence-bacad4/radar_fault", "ON"));
+    reset_records();
+    emit_connected();  // state survives a reconnect
+    assert(last_payload_contains("presence/presence-bacad4/radar_fault", "ON"));
+    ha_mqtt_publish_radar_fault(false);
+    assert(last_payload_contains("presence/presence-bacad4/radar_fault", "OFF"));
+
+    // The heartbeat sends the Wi-Fi signal even without presence traffic.
+    reset_records();
+    g_now_us += 31000000LL;
+    ha_mqtt_tick();
+    assert(last_payload_contains("presence/presence-bacad4/rssi", "-65"));
+    assert(last_payload_contains("presence/presence-bacad4/status", "online"));
+
+    printf("ok radar_health_and_heartbeat\n");
+}
+
+static void test_radar_settings_guarded_until_read(void) {
+    g_ld_config_valid = false;
+    g_ld_max_gate = 12;
+    reset_component(true);
+    emit_connected();
+    // No made-up radar settings reach HA...
+    assert(!topic_contains("presence/presence-bacad4/cfg/ld2420/detection_range_m"));
+    assert(!topic_contains("presence/presence-bacad4/cfg/ld2420/sensitivity"));
+    // ...and none are accepted from HA.
+    emit_data("presence/presence-bacad4/cmd/ld2420/detection_range_m", "4.9");
+    emit_data("presence/presence-bacad4/cmd/ld2420/sensitivity", "High");
+    assert(g_ld_max_gate == 12);
+    assert(g_sensitivity == 1);
+
+    // Once the radar has been read, states flow again.
+    g_ld_config_valid = true;
+    ha_mqtt_publish_ld2420_config_states();
+    assert(last_payload_contains("presence/presence-bacad4/cfg/ld2420/detection_range_m", "9.1"));
+
+    printf("ok radar_settings_guarded_until_read\n");
+}
+
 int main(void) {
     test_discovery_without_command_topics();
     test_discovery_with_command_topics();
@@ -765,5 +814,7 @@ int main(void) {
     test_ota_manifest_and_install_flow();
     test_ota_rejects_bad_manifests();
     test_ota_pauses_telemetry();
+    test_radar_health_and_heartbeat();
+    test_radar_settings_guarded_until_read();
     return 0;
 }

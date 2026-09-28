@@ -766,6 +766,60 @@ void ld2420_destroy(ld2420_t* sensor) {
     free(sensor);
 }
 
+// Check what the radar is sending and switch it to Energy Mode if it is not
+// already streaming energy frames. Used at start-up and after a recovery.
+static esp_err_t ensure_energy_mode(ld2420_t* sensor) {
+    const uart_port_t uart_port = sensor->uart_port;
+    esp_err_t err = ESP_OK;
+    ESP_LOGI(TAG, "Checking sensor output mode...");
+    uint8_t test_buf[BUF_SIZE];
+    int test_len = uart_read_bytes(uart_port, test_buf, sizeof(test_buf), pdMS_TO_TICKS(500));
+
+    if (test_len > 0) {
+        ESP_LOGD(TAG, "Sensor is outputting data (%d bytes)", test_len);
+
+        int zero_count = 0;
+        bool found_f4_header = false;
+
+        for (int i = 0; i < test_len; i++) {
+            if (test_buf[i] == 0x00) {
+                zero_count++;
+            }
+
+            if (i <= test_len - 4) {
+                if (test_buf[i] == 0xF4 && test_buf[i + 1] == 0xF3 &&
+                    test_buf[i + 2] == 0xF2 && test_buf[i + 3] == 0xF1) {
+                    found_f4_header = true;
+                    ESP_LOGD(TAG, "Found Energy Mode header at offset %d - sensor already configured", i);
+                }
+            }
+        }
+
+        if (!found_f4_header) {
+            if (zero_count > test_len * 0.8) {
+                ESP_LOGW(TAG, "Sensor in Debug/Waveform mode (>80%% zeros)");
+                ESP_LOGI(TAG, "Switching to Energy Mode...");
+            } else {
+                ESP_LOGI(TAG, "Unknown data format, attempting Energy Mode configuration...");
+            }
+            err = set_energy_mode(sensor);
+            if (err != ESP_OK) {
+                return err;
+            }
+        } else {
+            ESP_LOGI(TAG, "Sensor already in Energy Mode - ready to parse packets");
+        }
+    } else {
+        ESP_LOGW(TAG, "No initial data from sensor - configuring Energy Mode anyway");
+        err = set_energy_mode(sensor);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+
+    return ESP_OK;
+}
+
 // Initialize sensor
 esp_err_t ld2420_begin(ld2420_t* sensor, uart_port_t uart_port, gpio_num_t tx_pin, gpio_num_t rx_pin, int baud_rate) {
     if (sensor == NULL) {
@@ -810,52 +864,10 @@ esp_err_t ld2420_begin(ld2420_t* sensor, uart_port_t uart_port, gpio_num_t tx_pi
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    ESP_LOGI(TAG, "Checking sensor output mode...");
-    uint8_t test_buf[BUF_SIZE];
-    int test_len = uart_read_bytes(uart_port, test_buf, sizeof(test_buf), pdMS_TO_TICKS(500));
-
-    if (test_len > 0) {
-        ESP_LOGD(TAG, "Sensor is outputting data (%d bytes)", test_len);
-
-        int zero_count = 0;
-        bool found_f4_header = false;
-
-        for (int i = 0; i < test_len; i++) {
-            if (test_buf[i] == 0x00) {
-                zero_count++;
-            }
-
-            if (i <= test_len - 4) {
-                if (test_buf[i] == 0xF4 && test_buf[i + 1] == 0xF3 &&
-                    test_buf[i + 2] == 0xF2 && test_buf[i + 3] == 0xF1) {
-                    found_f4_header = true;
-                    ESP_LOGD(TAG, "Found Energy Mode header at offset %d - sensor already configured", i);
-                }
-            }
-        }
-
-        if (!found_f4_header) {
-            if (zero_count > test_len * 0.8) {
-                ESP_LOGW(TAG, "Sensor in Debug/Waveform mode (>80%% zeros)");
-                ESP_LOGI(TAG, "Switching to Energy Mode...");
-            } else {
-                ESP_LOGI(TAG, "Unknown data format, attempting Energy Mode configuration...");
-            }
-            err = set_energy_mode(sensor);
-            if (err != ESP_OK) {
-                goto fail;
-            }
-        } else {
-            ESP_LOGI(TAG, "Sensor already in Energy Mode - ready to parse packets");
-        }
-    } else {
-        ESP_LOGW(TAG, "No initial data from sensor - configuring Energy Mode anyway");
-        err = set_energy_mode(sensor);
-        if (err != ESP_OK) {
-            goto fail;
-        }
+    err = ensure_energy_mode(sensor);
+    if (err != ESP_OK) {
+        goto fail;
     }
-
     return ESP_OK;
 
 fail:
@@ -865,6 +877,26 @@ fail:
     return err;
 }
 
+
+esp_err_t ld2420_recover(ld2420_t* sensor) {
+    if (!sensor) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    ESP_LOGW(TAG, "Recovering radar: restart + Energy Mode check");
+    // A radar stuck in command mode still answers commands; restart it.
+    if (ld2420_enter_command_mode(sensor) == ESP_OK) {
+        esp_err_t rerr = ld2420_restart(sensor);
+        if (rerr != ESP_OK) {
+            ESP_LOGW(TAG, "Radar restart command failed (%s)", esp_err_to_name(rerr));
+            ld2420_exit_command_mode(sensor);
+        }
+    } else {
+        ESP_LOGW(TAG, "Radar does not answer commands");
+    }
+    vTaskDelay(pdMS_TO_TICKS(2000));  // radar boot time
+    uart_flush(sensor->uart_port);
+    return ensure_energy_mode(sensor);
+}
 
 // Initialize with OT2 pin support
 esp_err_t ld2420_begin_with_ot2(ld2420_t* sensor, uart_port_t uart_port, gpio_num_t tx_pin, 
