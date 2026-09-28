@@ -35,3 +35,8 @@ CONFIG_SECURE_SIGNED_APPS_RSA_SCHEME=y
 CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT=y
 CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES=y
 CONFIG_SECURE_BOOT_SIGNING_KEY="C:/Users/chris/.esp-keys/ld2420_ota_signing_key.pem"
+
+# MQTT event handling builds HA discovery payloads on the MQTT task; give it
+# headroom over the 6 KB default (a 2.5.0 dev build overflowed it).
+CONFIG_MQTT_USE_CUSTOM_CONFIG=y
+CONFIG_MQTT_TASK_STACK_SIZE=8192

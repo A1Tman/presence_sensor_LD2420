@@ -6,6 +6,10 @@
 extern "C" {
 #endif
 
+#define HA_MQTT_SENSITIVITY_LOW    0
+#define HA_MQTT_SENSITIVITY_MEDIUM 1
+#define HA_MQTT_SENSITIVITY_HIGH   2
+
 typedef struct {
     const char *broker_uri;      // e.g. "mqtt://192.168.1.23"
     const char *username;        // NULL if none
@@ -68,17 +72,26 @@ typedef struct {
     bool (*action_ota_install)(const char *url, const char *sha256_hex,
                                uint32_t size, const char *version);
 
-    // Optional LD2420 tuning getters/setters
+    // Optional LD2420 tuning getters/setters. Gates are 0..15, 70 cm each;
+    // HA shows them as metres ("Detection range", "Ignore closer than").
+    // The radar's own hold ("delay time") register is in seconds.
     int  (*get_ld_min_gate)(void);
     void (*set_ld_min_gate)(int);
     int  (*get_ld_max_gate)(void);
     void (*set_ld_max_gate)(int);
-    int  (*get_ld_delay_ms)(void);
-    void (*set_ld_delay_ms)(int);
-    int  (*get_ld_trigger_sens)(void);
-    void (*set_ld_trigger_sens)(int);
-    int  (*get_ld_maintain_sens)(void);
-    void (*set_ld_maintain_sens)(int);
+    int  (*get_ld_delay_s)(void);
+    void (*set_ld_delay_s)(int);
+
+    // Optional sensitivity preset over all 16 gate thresholds.
+    // get returns HA_MQTT_SENSITIVITY_* or -1 when the thresholds match no
+    // preset ("Custom"); set takes HA_MQTT_SENSITIVITY_*.
+    int  (*get_sensitivity)(void);
+    void (*set_sensitivity)(int level);
+
+    // Optional persistence for settings kept on the ESP32 (zones, smoothing).
+    // load returns false when the key is absent.
+    bool (*load_setting)(const char *key, int *out);
+    void (*save_setting)(const char *key, int value);
 
     // Legacy escape hatch for raw LD2420 commands (optional)
     // If provided, it may receive ad-hoc text commands.
@@ -138,6 +151,16 @@ void ha_mqtt_publish_ota_progress(int percent);
  * HA update dialog. On success the caller is expected to restart shortly.
  */
 void ha_mqtt_publish_ota_result(bool ok, const char *message);
+
+/**
+ * Publish when the device last restarted (Unix time, seconds), shown in HA as
+ * a "Last restart" timestamp. Call once wall-clock time is known (SNTP); the
+ * value is cached and republished on reconnect.
+ */
+void ha_mqtt_publish_boot_time(int64_t boot_epoch_s);
+
+/** Publish the current sensitivity preset (e.g. after thresholds change). */
+void ha_mqtt_publish_sensitivity_state(void);
 
 #ifdef __cplusplus
 }

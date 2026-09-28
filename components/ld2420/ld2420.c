@@ -399,10 +399,10 @@ esp_err_t ld2420_set_gate_range(ld2420_t* sensor, int min_gate, int max_gate) {
     return (e1 == ESP_OK && e2 == ESP_OK) ? ESP_OK : ESP_FAIL;
 }
 
-esp_err_t ld2420_set_delay_ms(ld2420_t* sensor, int delay_ms) {
-    if (delay_ms < 0) delay_ms = 0;
-    if (delay_ms > 65535) delay_ms = 65535;
-    return ld2420_set_param(sensor, 0x0004, (uint32_t)delay_ms);
+esp_err_t ld2420_set_delay_s(ld2420_t* sensor, int delay_s) {
+    if (delay_s < 0) delay_s = 0;
+    if (delay_s > 65535) delay_s = 65535;
+    return ld2420_set_param(sensor, 0x0004, (uint32_t)delay_s);
 }
 
 esp_err_t ld2420_set_trigger_sens(ld2420_t* sensor, int index, uint32_t value) {
@@ -417,31 +417,29 @@ esp_err_t ld2420_set_maintain_sens(ld2420_t* sensor, int index, uint32_t value) 
     return ld2420_set_param(sensor, (uint16_t)(0x0020 + index), value);
 }
 
-static esp_err_t ld2420_read_config_locked_internal(ld2420_t* sensor, ld2420_config_snapshot_t *out_config)
+#define READ_REGS_MAX 8
+
+// Read up to READ_REGS_MAX parameter registers in one command. Caller must
+// hold the UART lock and the radar must already be in command mode.
+static esp_err_t ld2420_read_regs_locked_internal(ld2420_t* sensor, const uint16_t *regs,
+                                                  size_t count, uint32_t *values)
 {
-    if (!sensor || !out_config) {
+    if (!sensor || !regs || !values || count == 0 || count > READ_REGS_MAX) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    const uint16_t regs[] = {
-        CMD_MIN_GATE_REG,
-        CMD_MAX_GATE_REG,
-        CMD_TIMEOUT_REG,
-        (uint16_t)(CMD_TRIGGER_BASE + 0),
-        (uint16_t)(CMD_MAINTAIN_BASE + 0),
-    };
-    uint8_t payload[sizeof(regs)] = {0};
-    for (size_t i = 0; i < sizeof(regs) / sizeof(regs[0]); ++i) {
+    uint8_t payload[READ_REGS_MAX * 2] = {0};
+    for (size_t i = 0; i < count; ++i) {
         payload[i * 2]     = (uint8_t)(regs[i] & 0xFF);
         payload[i * 2 + 1] = (uint8_t)((regs[i] >> 8) & 0xFF);
     }
 
-    esp_err_t err = send_frame(sensor, CMD_READ_ABD_PARAM, payload, sizeof(payload));
+    esp_err_t err = send_frame(sensor, CMD_READ_ABD_PARAM, payload, count * 2);
     if (err != ESP_OK) {
         return err;
     }
 
-    uint8_t rx[64] = {0};
+    uint8_t rx[96] = {0};
     size_t frame_len = 0;
     err = read_response(sensor, rx, sizeof(rx), 400, &frame_len);
     if (err != ESP_OK) {
@@ -461,6 +459,9 @@ static esp_err_t ld2420_read_config_locked_internal(ld2420_t* sensor, ld2420_con
         return ESP_ERR_INVALID_RESPONSE;
     }
     size_t footer_index = 4 + 2 + payload_len;
+    if (footer_index + 4 > frame_len || footer_index + 4 > sizeof(rx)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
     if (rx[footer_index] != RESPONSE_FOOTER0 || rx[footer_index + 1] != RESPONSE_FOOTER1 ||
         rx[footer_index + 2] != RESPONSE_FOOTER2 || rx[footer_index + 3] != RESPONSE_FOOTER3) {
         return ESP_ERR_INVALID_RESPONSE;
@@ -472,22 +473,41 @@ static esp_err_t ld2420_read_config_locked_internal(ld2420_t* sensor, ld2420_con
     }
 
     size_t data_bytes = payload_len - 4; // subtract command + status
-    const size_t expected_bytes = (sizeof(regs) / sizeof(regs[0])) * sizeof(uint32_t);
-    if (data_bytes < expected_bytes) {
+    if (data_bytes < count * sizeof(uint32_t)) {
         return ESP_ERR_INVALID_SIZE;
     }
 
-    size_t offset = 10;
-    uint32_t values[sizeof(regs) / sizeof(regs[0])] = {0};
-    for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+    const size_t offset = 10;
+    for (size_t i = 0; i < count; ++i) {
         uint32_t raw = 0;
         memcpy(&raw, &rx[offset + (i * 4)], sizeof(raw));
         values[i] = raw;
     }
+    return ESP_OK;
+}
+
+static esp_err_t ld2420_read_config_locked_internal(ld2420_t* sensor, ld2420_config_snapshot_t *out_config)
+{
+    if (!sensor || !out_config) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const uint16_t regs[] = {
+        CMD_MIN_GATE_REG,
+        CMD_MAX_GATE_REG,
+        CMD_TIMEOUT_REG,
+        (uint16_t)(CMD_TRIGGER_BASE + 0),
+        (uint16_t)(CMD_MAINTAIN_BASE + 0),
+    };
+    uint32_t values[sizeof(regs) / sizeof(regs[0])] = {0};
+    esp_err_t err = ld2420_read_regs_locked_internal(sensor, regs, sizeof(regs) / sizeof(regs[0]), values);
+    if (err != ESP_OK) {
+        return err;
+    }
 
     out_config->min_gate = (int)values[0];
     out_config->max_gate = (int)values[1];
-    out_config->delay_ms = (int)values[2];
+    out_config->delay_s = (int)values[2];
     out_config->trigger_sensitivity = values[3];
     out_config->maintain_sensitivity = values[4];
 
@@ -516,6 +536,43 @@ esp_err_t ld2420_read_config(ld2420_t* sensor, ld2420_config_snapshot_t *out_con
         err = exit_err;
     }
 
+    uart_lock_give(sensor);
+    return err;
+}
+
+esp_err_t ld2420_read_thresholds(ld2420_t* sensor, uint32_t trigger[LD2420_GATE_COUNT],
+                                 uint32_t maintain[LD2420_GATE_COUNT])
+{
+    if (!sensor || !trigger || !maintain) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!uart_lock_take(sensor, portMAX_DELAY)) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t err = ld2420_enter_command_mode(sensor);
+    if (err != ESP_OK) {
+        uart_lock_give(sensor);
+        return err;
+    }
+
+    for (int half = 0; half < 2 && err == ESP_OK; ++half) {
+        uint16_t regs[READ_REGS_MAX];
+        for (int i = 0; i < READ_REGS_MAX; ++i) {
+            regs[i] = (uint16_t)(CMD_TRIGGER_BASE + half * READ_REGS_MAX + i);
+        }
+        err = ld2420_read_regs_locked_internal(sensor, regs, READ_REGS_MAX, &trigger[half * READ_REGS_MAX]);
+        if (err != ESP_OK) break;
+        for (int i = 0; i < READ_REGS_MAX; ++i) {
+            regs[i] = (uint16_t)(CMD_MAINTAIN_BASE + half * READ_REGS_MAX + i);
+        }
+        err = ld2420_read_regs_locked_internal(sensor, regs, READ_REGS_MAX, &maintain[half * READ_REGS_MAX]);
+    }
+
+    esp_err_t exit_err = ld2420_exit_command_mode(sensor);
+    if (err == ESP_OK && exit_err != ESP_OK) {
+        err = exit_err;
+    }
     uart_lock_give(sensor);
     return err;
 }

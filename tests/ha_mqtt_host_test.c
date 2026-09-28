@@ -39,9 +39,13 @@ static int g_movement_threshold = 5;
 static int g_hold_on_ms = 30000;
 static int g_ld_min_gate = 0;
 static int g_ld_max_gate = 12;
-static int g_ld_delay_ms = 30;
-static int g_ld_trigger = 60000;
-static int g_ld_maintain = 40000;
+static int g_ld_delay_s = 30;
+static int g_sensitivity = 1;
+
+#define MAX_SETTINGS 16
+static char g_setting_keys[MAX_SETTINGS][16];
+static int g_setting_values[MAX_SETTINGS];
+static int g_setting_count;
 static esp_mqtt_client_config_t g_last_client_config;
 static int g_client_started;
 static int g_ota_calls;
@@ -110,12 +114,31 @@ static void set_ld_max_gate(int value) {
     g_ld_max_gate = value;
     if (g_ld_max_gate < g_ld_min_gate) g_ld_min_gate = g_ld_max_gate;
 }
-static int get_ld_delay_ms(void) { return g_ld_delay_ms; }
-static void set_ld_delay_ms(int value) { g_ld_delay_ms = value; }
-static int get_ld_trigger(void) { return g_ld_trigger; }
-static void set_ld_trigger(int value) { g_ld_trigger = value; }
-static int get_ld_maintain(void) { return g_ld_maintain; }
-static void set_ld_maintain(int value) { g_ld_maintain = value; }
+static int get_ld_delay_s(void) { return g_ld_delay_s; }
+static void set_ld_delay_s(int value) { g_ld_delay_s = value; }
+static int get_sensitivity(void) { return g_sensitivity; }
+static void set_sensitivity(int level) { g_sensitivity = level; }
+
+static bool load_setting(const char *key, int *out) {
+    for (int i = 0; i < g_setting_count; ++i) {
+        if (strcmp(g_setting_keys[i], key) == 0) { *out = g_setting_values[i]; return true; }
+    }
+    return false;
+}
+
+static void save_setting(const char *key, int value) {
+    for (int i = 0; i < g_setting_count; ++i) {
+        if (strcmp(g_setting_keys[i], key) == 0) { g_setting_values[i] = value; return; }
+    }
+    assert(g_setting_count < MAX_SETTINGS);
+    snprintf(g_setting_keys[g_setting_count], sizeof(g_setting_keys[0]), "%s", key);
+    g_setting_values[g_setting_count++] = value;
+}
+
+static int saved_setting(const char *key) {
+    int v = -1;
+    return load_setting(key, &v) ? v : -1;
+}
 static void apply_config(void) { g_apply_called++; }
 
 static char g_ota_url[256];
@@ -289,12 +312,12 @@ static ha_mqtt_cfg_t base_config(bool commands_enabled) {
         .set_ld_min_gate = set_ld_min_gate,
         .get_ld_max_gate = get_ld_max_gate,
         .set_ld_max_gate = set_ld_max_gate,
-        .get_ld_delay_ms = get_ld_delay_ms,
-        .set_ld_delay_ms = set_ld_delay_ms,
-        .get_ld_trigger_sens = get_ld_trigger,
-        .set_ld_trigger_sens = set_ld_trigger,
-        .get_ld_maintain_sens = get_ld_maintain,
-        .set_ld_maintain_sens = set_ld_maintain,
+        .get_ld_delay_s = get_ld_delay_s,
+        .set_ld_delay_s = set_ld_delay_s,
+        .get_sensitivity = get_sensitivity,
+        .set_sensitivity = set_sensitivity,
+        .load_setting = load_setting,
+        .save_setting = save_setting,
         .action_apply_config = apply_config,
         .action_ota_install = ota_install,
     };
@@ -345,10 +368,11 @@ static void test_discovery_without_command_topics(void) {
     emit_connected();
 
     assert(topic_contains("binary_sensor/presence-bacad4/presence/config"));
-    assert(topic_contains("sensor/presence-bacad4/ld_fw/config"));
-    assert(payload_contains_for_topic("sensor/presence-bacad4/ld_fw/config", "\"name\":\"LD2420 Firmware\""));
+    assert(topic_contains("sensor/presence-bacad4/radar_firmware/config"));
+    assert(payload_contains_for_topic("sensor/presence-bacad4/radar_firmware/config", "\"name\":\"Radar firmware\""));
     assert(payload_contains_for_topic("presence-bacad4/attributes", "\"sw_version\":\"9.8.7\""));
-    assert(!payload_contains_for_topic("number/presence-bacad4/movement_thresh/config", "\"cmd_t\""));
+    assert(!payload_contains_for_topic("number/presence-bacad4/movement_threshold/config", "\"cmd_t\""));
+    assert(!payload_contains_for_topic("select/presence-bacad4/sensitivity/config", "\"cmd_t\""));
     assert(!subscribed_to("/cmd/"));
 
     printf("ok discovery_without_command_topics\n");
@@ -358,8 +382,10 @@ static void test_discovery_with_command_topics(void) {
     reset_component(true);
     emit_connected();
 
-    assert(payload_contains_for_topic("number/presence-bacad4/movement_thresh/config", "\"cmd_t\""));
-    assert(payload_contains_for_topic("button/presence-bacad4/apply_config/config", "\"cmd_t\""));
+    assert(payload_contains_for_topic("number/presence-bacad4/movement_threshold/config", "\"cmd_t\""));
+    // The Apply Config button is gone: its old discovery config is cleared.
+    const char *apply_disc = last_payload_for_topic("button/presence-bacad4/apply_config/config");
+    assert(apply_disc && apply_disc[0] == '\0');
     assert(subscribed_to("/cmd/movement_threshold_cm"));
     assert(subscribed_to("/cmd/apply_config"));
     assert(payload_contains_for_topic("binary_sensor/presence-bacad4/presence/config",
@@ -413,14 +439,156 @@ static void test_ld_gate_normalization_republishes_pair(void) {
     emit_connected();
     reset_records();
 
-    emit_data("presence/presence-bacad4/cmd/ld2420/min_gate", "15");
+    // 10.5 m = gate 15; max gate follows, so both states are republished.
+    emit_data("presence/presence-bacad4/cmd/ld2420/min_distance_m", "10.5");
 
     assert(g_ld_min_gate == 15);
     assert(g_ld_max_gate == 15);
-    assert(payload_contains_for_topic("presence/presence-bacad4/cfg/ld2420/min_gate", "15"));
-    assert(payload_contains_for_topic("presence/presence-bacad4/cfg/ld2420/max_gate", "15"));
+    assert(last_payload_contains("presence/presence-bacad4/cfg/ld2420/min_distance_m", "10.5"));
+    assert(last_payload_contains("presence/presence-bacad4/cfg/ld2420/detection_range_m", "11.2"));
 
     printf("ok ld_gate_normalization_republishes_pair\n");
+}
+
+#define DISC(component, object) "homeassistant/" component "/presence-bacad4/" object "/config"
+
+static void test_v250_entity_set(void) {
+    g_ld_min_gate = 0;
+    g_ld_max_gate = 12;
+    g_sensitivity = 1;
+    reset_component(true);
+    emit_connected();
+
+    // Entity IDs follow the device name ("Kitchen Radar").
+    assert(payload_contains_for_topic(DISC("binary_sensor", "presence"), "\"default_entity_id\":\"binary_sensor.kitchen_radar\""));
+    assert(payload_contains_for_topic(DISC("binary_sensor", "near_zone"), "\"name\":\"Near zone\""));
+    assert(payload_contains_for_topic(DISC("binary_sensor", "near_zone"), "\"dev_cla\":\"occupancy\""));
+    assert(payload_contains_for_topic(DISC("binary_sensor", "far_zone"), "binary_sensor.kitchen_radar_far_zone"));
+    assert(payload_contains_for_topic(DISC("sensor", "distance"), "\"sug_dsp_prc\":0"));
+    assert(payload_contains_for_topic(DISC("sensor", "last_restart"), "\"dev_cla\":\"timestamp\""));
+    assert(payload_contains_for_topic(DISC("sensor", "signal"), "\"ent_cat\":\"diagnostic\""));
+
+    // Everyday settings are enabled, advanced ones registered disabled.
+    assert(payload_contains_for_topic(DISC("select", "sensitivity"), "[\"Low\",\"Medium\",\"High\",\"Custom\"]"));
+    assert(payload_contains_for_topic(DISC("number", "detection_range"), "\"unit_of_meas\":\"m\""));
+    assert(!payload_contains_for_topic(DISC("number", "detection_range"), "\"en\":false"));
+    assert(payload_contains_for_topic(DISC("number", "mid_end"), "\"name\":\"Mid zone ends at\""));
+    assert(payload_contains_for_topic(DISC("number", "min_distance"), "\"en\":false"));
+    assert(payload_contains_for_topic(DISC("number", "radar_hold"), "\"en\":false"));
+    assert(payload_contains_for_topic(DISC("number", "movement_threshold"), "\"en\":false"));
+    assert(payload_contains_for_topic(DISC("number", "smoothing"), "\"en\":false"));
+
+    // Entities from older firmware are removed.
+    const char *legacy[] = {
+        DISC("number", "ld_trig_sens"), DISC("number", "ld_maint_sens"), DISC("number", "near_min"),
+        DISC("sensor", "uptime"), DISC("sensor", "ld_fw"), DISC("binary_sensor", "movement_1"),
+    };
+    for (size_t i = 0; i < sizeof(legacy) / sizeof(legacy[0]); ++i) {
+        const char *payload = last_payload_for_topic(legacy[i]);
+        assert(payload && payload[0] == '\0');
+    }
+
+    // Initial states in HA units.
+    assert(last_payload_contains("presence/presence-bacad4/cfg/ld2420/detection_range_m", "9.1"));
+    assert(last_payload_contains("presence/presence-bacad4/cfg/ld2420/min_distance_m", "0.0"));
+    assert(last_payload_contains("presence/presence-bacad4/cfg/ld2420/sensitivity", "Medium"));
+    assert(!subscribed_to("/cmd/zone/near/min_cm"));
+
+    printf("ok v250_entity_set\n");
+}
+
+static void test_detection_range_in_metres(void) {
+    reset_component(true);
+    emit_connected();
+
+    emit_data("presence/presence-bacad4/cmd/ld2420/detection_range_m", "4.9");
+    assert(g_ld_max_gate == 6);
+    assert(last_payload_contains("presence/presence-bacad4/cfg/ld2420/detection_range_m", "4.9"));
+
+    emit_data("presence/presence-bacad4/cmd/ld2420/detection_range_m", "11.2");
+    assert(g_ld_max_gate == 15);
+
+    const char *bad[] = {"abc", "0.3", "12.0", "-1", "", "4.9m"};
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); ++i) {
+        emit_data("presence/presence-bacad4/cmd/ld2420/detection_range_m", bad[i]);
+        assert(g_ld_max_gate == 15);
+    }
+
+    emit_data("presence/presence-bacad4/cmd/ld2420/delay_time", "45");
+    assert(g_ld_delay_s == 45);
+    emit_data("presence/presence-bacad4/cmd/ld2420/delay_time", "4000");
+    assert(g_ld_delay_s == 45);
+
+    printf("ok detection_range_in_metres\n");
+}
+
+static void test_sensitivity_select(void) {
+    reset_component(true);
+    emit_connected();
+
+    emit_data("presence/presence-bacad4/cmd/ld2420/sensitivity", "High");
+    assert(g_sensitivity == 2);
+    assert(last_payload_contains("presence/presence-bacad4/cfg/ld2420/sensitivity", "High"));
+
+    // "Custom" and unknown values change nothing and republish the state.
+    emit_data("presence/presence-bacad4/cmd/ld2420/sensitivity", "Custom");
+    emit_data("presence/presence-bacad4/cmd/ld2420/sensitivity", "high");
+    assert(g_sensitivity == 2);
+
+    g_sensitivity = -1;
+    ha_mqtt_publish_sensitivity_state();
+    assert(last_payload_contains("presence/presence-bacad4/cfg/ld2420/sensitivity", "Custom"));
+
+    g_sensitivity = 1;
+    printf("ok sensitivity_select\n");
+}
+
+static void test_zones_contiguous_and_persisted(void) {
+    g_setting_count = 0;
+    reset_component(true);
+    emit_connected();
+
+    emit_data("presence/presence-bacad4/cmd/zone/near/max_cm", "150");
+    assert(saved_setting("zone0_end") == 150);
+    // Mid now starts at 151 and cannot end before it.
+    emit_data("presence/presence-bacad4/cmd/zone/mid/max_cm", "120");
+    assert(saved_setting("zone1_end") == 151);
+    assert(last_payload_contains("presence/presence-bacad4/cfg/zone/mid/max_cm", "151"));
+
+    emit_data("presence/presence-bacad4/cmd/distance_smoothing", "7");
+    assert(saved_setting("smoothing") == 7);
+
+    // A restart restores the saved values.
+    reset_component(true);
+    emit_connected();
+    assert(last_payload_contains("presence/presence-bacad4/cfg/zone/near/max_cm", "150"));
+    assert(last_payload_contains("presence/presence-bacad4/cfg/zone/mid/max_cm", "151"));
+    assert(last_payload_contains("presence/presence-bacad4/cfg/distance_smoothing", "7"));
+
+    // Presence at 140 cm now falls in the near zone.
+    ha_mqtt_publish_presence(true, 1400);
+    assert(last_payload_contains("presence/presence-bacad4/movement/near_range", "ON"));
+
+    g_setting_count = 0;
+    printf("ok zones_contiguous_and_persisted\n");
+}
+
+static void test_last_restart_timestamp(void) {
+    reset_component(true);
+    emit_connected();
+    assert(!topic_contains("presence/presence-bacad4/last_restart"));
+
+    ha_mqtt_publish_boot_time(1790000000);
+    assert(last_payload_contains("presence/presence-bacad4/last_restart", "2026-09-21T14:13:20+00:00"));
+
+    ha_mqtt_publish_boot_time(951782400);  // leap day
+    assert(last_payload_contains("presence/presence-bacad4/last_restart", "2000-02-29T00:00:00+00:00"));
+
+    reset_records();
+    emit_connected();  // republished on reconnect
+    assert(last_payload_contains("presence/presence-bacad4/last_restart", "2000-02-29T00:00:00+00:00"));
+
+    printf("ok last_restart_timestamp\n");
 }
 
 #define OTA_STATE    "presence/presence-bacad4/ota/state"
@@ -561,14 +729,41 @@ static void test_ota_rejects_bad_manifests(void) {
     printf("ok ota_rejects_bad_manifests\n");
 }
 
+static void test_ota_pauses_telemetry(void) {
+    reset_component(true);
+    emit_connected();
+    emit_retained_data(OTA_MANIFEST, OTA_GOOD_MANIFEST);
+    emit_data(OTA_INSTALL, "install");
+    assert(g_ota_calls == 1);
+
+    // No presence/distance traffic while the download runs.
+    reset_records();
+    ha_mqtt_publish_presence(true, 2500);
+    assert(!topic_contains("presence/presence-bacad4/presence"));
+    assert(!topic_contains("presence/presence-bacad4/movement_distance_cm"));
+
+    // A failed install catches HA up with the latest state.
+    ha_mqtt_publish_ota_result(false, "read error at 524288 bytes");
+    assert(last_payload_contains("presence/presence-bacad4/presence", "ON"));
+    assert(last_payload_contains("presence/presence-bacad4/movement_distance_cm", "250.0"));
+
+    printf("ok ota_pauses_telemetry\n");
+}
+
 int main(void) {
     test_discovery_without_command_topics();
     test_discovery_with_command_topics();
     test_reconnect_republishes_cached_state();
     test_command_validation_and_gating();
     test_ld_gate_normalization_republishes_pair();
+    test_v250_entity_set();
+    test_detection_range_in_metres();
+    test_sensitivity_select();
+    test_zones_contiguous_and_persisted();
+    test_last_restart_timestamp();
     test_ota_discovery_and_initial_state();
     test_ota_manifest_and_install_flow();
     test_ota_rejects_bad_manifests();
+    test_ota_pauses_telemetry();
     return 0;
 }

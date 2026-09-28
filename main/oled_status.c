@@ -143,7 +143,7 @@ static void render_config_page(const oled_status_snapshot_t *snapshot)
     char lines[OLED_BODY_LINE_COUNT][OLED_LINE_LEN] = {{0}};
 
     snprintf(lines[0], sizeof(lines[0]), "Gate %d-%d", snapshot->min_gate, snapshot->max_gate);
-    snprintf(lines[1], sizeof(lines[1]), "Delay %dms", snapshot->delay_ms);
+    snprintf(lines[1], sizeof(lines[1]), "Hold %ds", snapshot->delay_s);
     snprintf(lines[2], sizeof(lines[2]), "Trig %d", snapshot->trigger_sens);
     snprintf(lines[3], sizeof(lines[3]), "T %d %.6s",
              snapshot->maintain_sens,

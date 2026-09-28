@@ -14,6 +14,8 @@
 #include "nvs.h"
 #include "esp_err.h"
 #include "esp_app_desc.h"
+#include "esp_netif_sntp.h"
+#include <time.h>
 
 #include "ld2420.h"  // LD2420 library
 #include "ha_mqtt.h"
@@ -39,8 +41,8 @@
 #define PRESENCE_TIMEOUT_MAX_S     300
 #define GATE_MIN                   0
 #define GATE_MAX                   15
-#define DELAY_MIN_MS               0
-#define DELAY_MAX_MS               65535
+#define RADAR_HOLD_MIN_S               0
+#define RADAR_HOLD_MAX_S           3600    // LD2420 "delay time" register is in seconds
 #define DETECT_LOG_DELTA_CM        5
 #define LOOP_STATUS_INTERVAL_ITERS 100   // ~10s at 100ms loop delay
 // A freshly installed OTA image must reach MQTT and see valid radar frames
@@ -50,6 +52,20 @@
 #define MOVEMENT_LOG_INTERVAL_US   (2LL * 1000000LL)
 #define APPLY_CONFIG_TASK_STACK    4096
 #define APPLY_CONFIG_TASK_PRIO     3
+// Radar settings changed from HA are written once they stop changing.
+#define APPLY_DEBOUNCE_US          (2LL * 1000000LL)
+// Any wall-clock time before this means SNTP has not synced yet.
+#define MIN_VALID_EPOCH_S          1700000000LL
+
+// LD2420 factory energy thresholds per gate (as used by ESPHome's ld2420
+// component). Sensitivity presets scale them: a lower threshold means a
+// weaker reflection already counts, i.e. more sensitive.
+static const uint32_t FACTORY_TRIGGER_THRESH[LD2420_GATE_COUNT] = {
+    60000, 30000, 400, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250, 250};
+static const uint32_t FACTORY_MAINTAIN_THRESH[LD2420_GATE_COUNT] = {
+    40000, 20000, 200, 200, 200, 200, 200, 150, 150, 100, 100, 100, 100, 100, 100, 100};
+// Threshold scale in percent for HA_MQTT_SENSITIVITY_LOW / MEDIUM / HIGH.
+static const uint32_t SENSITIVITY_SCALE_PCT[3] = {160, 100, 60};
 
 #ifndef MQTT_ALLOW_ANONYMOUS_COMMANDS
 #define MQTT_ALLOW_ANONYMOUS_COMMANDS 0
@@ -86,6 +102,8 @@ static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num = 0;
 static SemaphoreHandle_t s_state_mutex = NULL;
 static TaskHandle_t s_apply_config_task_handle = NULL;
+static esp_timer_handle_t s_apply_debounce_timer = NULL;
+static void schedule_apply_ld_config(void);
 
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
@@ -112,9 +130,11 @@ static bool s_creds_ok = false;
 // LD2420 tuning (current values)
 static int s_ld_min_gate = 0;        // 0..15
 static int s_ld_max_gate = 15;       // 0..15
-static int s_ld_delay_ms = 0;        // 0..65535
+static int s_ld_delay_s = 0;        // 0..65535
 static int s_ld_trigger_sens = 200;  // 0..65535
 static int s_ld_maintain_sens = 150; // 0..65535
+static int s_ld_sensitivity = -1;         // HA_MQTT_SENSITIVITY_*, -1 = custom/unknown
+static bool s_ld_sensitivity_pending = false; // preset chosen in HA, not yet written
 
 static bool detect_movement(int distance_cm) {
     // Caller must hold s_state_mutex
@@ -250,6 +270,20 @@ static void app_config_save_i32(const char *key, int32_t value) {
     }
 }
 
+static bool app_setting_load(const char *key, int *out) {
+    nvs_handle_t h;
+    if (nvs_open(APP_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return false;
+    int32_t v;
+    bool ok = nvs_get_i32(h, key, &v) == ESP_OK;
+    nvs_close(h);
+    if (ok) *out = (int)v;
+    return ok;
+}
+
+static void app_setting_save(const char *key, int value) {
+    app_config_save_i32(key, (int32_t)value);
+}
+
 // Restore persisted tunables. Called once at boot, after nvs_flash_init.
 // Out-of-range values are ignored so a corrupted entry can't push the device
 // outside its operating envelope.
@@ -310,22 +344,54 @@ static void set_presence_timeout_ms(int val_ms) {
 
 // LD2420 tuning get/set (exposed to MQTT)
 static int  get_ld_min_gate(void)        { xSemaphoreTake(s_state_mutex, portMAX_DELAY); int v=s_ld_min_gate; xSemaphoreGive(s_state_mutex); return v; }
-static void set_ld_min_gate(int v)       { xSemaphoreTake(s_state_mutex, portMAX_DELAY); if (v < GATE_MIN) v = GATE_MIN; if (v > GATE_MAX) v = GATE_MAX; s_ld_min_gate = v; if (s_ld_min_gate > s_ld_max_gate) s_ld_max_gate = s_ld_min_gate; xSemaphoreGive(s_state_mutex); ESP_LOGI(TAG, "LD min_gate=%d", s_ld_min_gate); }
+static void set_ld_min_gate(int v)       { xSemaphoreTake(s_state_mutex, portMAX_DELAY); if (v < GATE_MIN) v = GATE_MIN; if (v > GATE_MAX) v = GATE_MAX; s_ld_min_gate = v; if (s_ld_min_gate > s_ld_max_gate) s_ld_max_gate = s_ld_min_gate; xSemaphoreGive(s_state_mutex); ESP_LOGI(TAG, "LD min_gate=%d", s_ld_min_gate); schedule_apply_ld_config(); }
 static int  get_ld_max_gate(void)        { xSemaphoreTake(s_state_mutex, portMAX_DELAY); int v=s_ld_max_gate; xSemaphoreGive(s_state_mutex); return v; }
-static void set_ld_max_gate(int v)       { xSemaphoreTake(s_state_mutex, portMAX_DELAY); if (v < GATE_MIN) v = GATE_MIN; if (v > GATE_MAX) v = GATE_MAX; s_ld_max_gate = v; if (s_ld_max_gate < s_ld_min_gate) s_ld_min_gate = s_ld_max_gate; xSemaphoreGive(s_state_mutex); ESP_LOGI(TAG, "LD max_gate=%d", s_ld_max_gate); }
-static int  get_ld_delay_ms(void)        { xSemaphoreTake(s_state_mutex, portMAX_DELAY); int v=s_ld_delay_ms; xSemaphoreGive(s_state_mutex); return v; }
-static void set_ld_delay_ms(int v)       { xSemaphoreTake(s_state_mutex, portMAX_DELAY); if (v < DELAY_MIN_MS) v = DELAY_MIN_MS; if (v > DELAY_MAX_MS) v = DELAY_MAX_MS; s_ld_delay_ms = v; xSemaphoreGive(s_state_mutex); ESP_LOGI(TAG, "LD delay_ms=%d", s_ld_delay_ms); }
-static int  get_ld_trigger_sens(void)    { xSemaphoreTake(s_state_mutex, portMAX_DELAY); int v=s_ld_trigger_sens; xSemaphoreGive(s_state_mutex); return v; }
-static void set_ld_trigger_sens(int v)   { xSemaphoreTake(s_state_mutex, portMAX_DELAY); if (v < 0) v = 0; if (v > 65535) v = 65535; s_ld_trigger_sens = v; xSemaphoreGive(s_state_mutex); ESP_LOGI(TAG, "LD trigger_sens=%d", s_ld_trigger_sens); }
-static int  get_ld_maintain_sens(void)   { xSemaphoreTake(s_state_mutex, portMAX_DELAY); int v=s_ld_maintain_sens; xSemaphoreGive(s_state_mutex); return v; }
-static void set_ld_maintain_sens(int v)  { xSemaphoreTake(s_state_mutex, portMAX_DELAY); if (v < 0) v = 0; if (v > 65535) v = 65535; s_ld_maintain_sens = v; xSemaphoreGive(s_state_mutex); ESP_LOGI(TAG, "LD maintain_sens=%d", s_ld_maintain_sens); }
+static void set_ld_max_gate(int v)       { xSemaphoreTake(s_state_mutex, portMAX_DELAY); if (v < GATE_MIN) v = GATE_MIN; if (v > GATE_MAX) v = GATE_MAX; s_ld_max_gate = v; if (s_ld_max_gate < s_ld_min_gate) s_ld_min_gate = s_ld_max_gate; xSemaphoreGive(s_state_mutex); ESP_LOGI(TAG, "LD max_gate=%d", s_ld_max_gate); schedule_apply_ld_config(); }
+static int  get_ld_delay_s(void)        { xSemaphoreTake(s_state_mutex, portMAX_DELAY); int v=s_ld_delay_s; xSemaphoreGive(s_state_mutex); return v; }
+static void set_ld_delay_s(int v)       { xSemaphoreTake(s_state_mutex, portMAX_DELAY); if (v < RADAR_HOLD_MIN_S) v = RADAR_HOLD_MIN_S; if (v > RADAR_HOLD_MAX_S) v = RADAR_HOLD_MAX_S; s_ld_delay_s = v; xSemaphoreGive(s_state_mutex); ESP_LOGI(TAG, "LD delay_s=%d", s_ld_delay_s); schedule_apply_ld_config(); }
+
+static uint32_t preset_threshold(int level, const uint32_t *table, int gate) {
+    uint32_t v = table[gate] * SENSITIVITY_SCALE_PCT[level] / 100U;
+    return v > 65535U ? 65535U : v;
+}
+
+// Which preset (if any) exactly matches the radar's threshold table.
+static int classify_sensitivity(const uint32_t trig[LD2420_GATE_COUNT],
+                                const uint32_t maint[LD2420_GATE_COUNT]) {
+    for (int level = HA_MQTT_SENSITIVITY_LOW; level <= HA_MQTT_SENSITIVITY_HIGH; ++level) {
+        bool match = true;
+        for (int g = 0; g < LD2420_GATE_COUNT && match; ++g) {
+            match = trig[g] == preset_threshold(level, FACTORY_TRIGGER_THRESH, g) &&
+                    maint[g] == preset_threshold(level, FACTORY_MAINTAIN_THRESH, g);
+        }
+        if (match) return level;
+    }
+    return -1;
+}
+
+static void schedule_apply_ld_config(void) {
+    if (s_apply_debounce_timer == NULL) return;
+    esp_timer_stop(s_apply_debounce_timer);  // restart the quiet period
+    esp_timer_start_once(s_apply_debounce_timer, APPLY_DEBOUNCE_US);
+}
+
+static int  get_sensitivity(void) { xSemaphoreTake(s_state_mutex, portMAX_DELAY); int v = s_ld_sensitivity; xSemaphoreGive(s_state_mutex); return v; }
+static void set_sensitivity(int level) {
+    if (level < HA_MQTT_SENSITIVITY_LOW || level > HA_MQTT_SENSITIVITY_HIGH) return;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_ld_sensitivity = level;
+    s_ld_sensitivity_pending = true;
+    xSemaphoreGive(s_state_mutex);
+    ESP_LOGI(TAG, "LD sensitivity preset=%d", level);
+    schedule_apply_ld_config();
+}
 
 static void update_ld_state_from_snapshot(const ld2420_config_snapshot_t *snapshot) {
     if (!snapshot) return;
 
     int min_gate = snapshot->min_gate;
     int max_gate = snapshot->max_gate;
-    int delay_ms = snapshot->delay_ms;
+    int delay_s = snapshot->delay_s;
     int trig0_local = (snapshot->trigger_sensitivity > 65535U) ? 65535 : (int)snapshot->trigger_sensitivity;
     int hold0_local = (snapshot->maintain_sensitivity > 65535U) ? 65535 : (int)snapshot->maintain_sensitivity;
 
@@ -334,16 +400,35 @@ static void update_ld_state_from_snapshot(const ld2420_config_snapshot_t *snapsh
     if (max_gate < GATE_MIN) max_gate = GATE_MIN;
     if (max_gate > GATE_MAX) max_gate = GATE_MAX;
     if (min_gate > max_gate) max_gate = min_gate;
-    if (delay_ms < DELAY_MIN_MS) delay_ms = DELAY_MIN_MS;
-    if (delay_ms > DELAY_MAX_MS) delay_ms = DELAY_MAX_MS;
+    if (delay_s < RADAR_HOLD_MIN_S) delay_s = RADAR_HOLD_MIN_S;
+    if (delay_s > RADAR_HOLD_MAX_S) delay_s = RADAR_HOLD_MAX_S;
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     s_ld_min_gate = min_gate;
     s_ld_max_gate = max_gate;
-    s_ld_delay_ms = delay_ms;
+    s_ld_delay_s = delay_s;
     s_ld_trigger_sens = trig0_local;
     s_ld_maintain_sens = hold0_local;
     xSemaphoreGive(s_state_mutex);
+}
+
+static void sync_ld_sensitivity_from_sensor(void) {
+    uint32_t trig[LD2420_GATE_COUNT] = {0};
+    uint32_t maint[LD2420_GATE_COUNT] = {0};
+    esp_err_t err = ld2420_read_thresholds(s_sensor, trig, maint);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Unable to read LD2420 gate thresholds (%s)", esp_err_to_name(err));
+        return;
+    }
+    int level = classify_sensitivity(trig, maint);
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_ld_sensitivity = level;
+    xSemaphoreGive(s_state_mutex);
+    ESP_LOGI(TAG, "LD2420 thresholds (move/still per gate), preset=%d:", level);
+    for (int g = 0; g < LD2420_GATE_COUNT; ++g) {
+        ESP_LOGI(TAG, "  gate %2d (%3d-%3d cm): %5" PRIu32 " / %5" PRIu32,
+                 g, g * 70, (g + 1) * 70, trig[g], maint[g]);
+    }
 }
 
 static esp_err_t sync_ld_config_from_sensor(void) {
@@ -357,8 +442,9 @@ static esp_err_t sync_ld_config_from_sensor(void) {
     }
 
     update_ld_state_from_snapshot(&snapshot);
-    ESP_LOGI(TAG, "Synced LD2420 config: min_gate=%d max_gate=%d delay_ms=%d trig0=%" PRIu32 " maintain0=%" PRIu32,
-             snapshot.min_gate, snapshot.max_gate, snapshot.delay_ms,
+    sync_ld_sensitivity_from_sensor();
+    ESP_LOGI(TAG, "Synced LD2420 config: min_gate=%d max_gate=%d delay_s=%d trig0=%" PRIu32 " maintain0=%" PRIu32,
+             snapshot.min_gate, snapshot.max_gate, snapshot.delay_s,
              snapshot.trigger_sensitivity, snapshot.maintain_sensitivity);
     return ESP_OK;
 }
@@ -369,7 +455,7 @@ static void apply_ld_config(void) {
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     int min_gate = s_ld_min_gate;
     int max_gate = s_ld_max_gate;
-    int delay_ms = s_ld_delay_ms;
+    int delay_s = s_ld_delay_s;
     int trig0    = s_ld_trigger_sens;
     int hold0    = s_ld_maintain_sens;
 
@@ -378,21 +464,27 @@ static void apply_ld_config(void) {
     if (max_gate < GATE_MIN) max_gate = GATE_MIN;
     if (max_gate > GATE_MAX) max_gate = GATE_MAX;
     if (min_gate > max_gate) max_gate = min_gate;
-    if (delay_ms < DELAY_MIN_MS) delay_ms = DELAY_MIN_MS;
-    if (delay_ms > DELAY_MAX_MS) delay_ms = DELAY_MAX_MS;
+    if (delay_s < RADAR_HOLD_MIN_S) delay_s = RADAR_HOLD_MIN_S;
+    if (delay_s > RADAR_HOLD_MAX_S) delay_s = RADAR_HOLD_MAX_S;
 
     int trig0_local = (trig0 < 0) ? 0 : (trig0 > 65535 ? 65535 : trig0);
     int hold0_local = (hold0 < 0) ? 0 : (hold0 > 65535 ? 65535 : hold0);
+    int sens_level = s_ld_sensitivity_pending ? s_ld_sensitivity : -1;
+    s_ld_sensitivity_pending = false;
+    if (sens_level >= 0) {
+        trig0_local = (int)preset_threshold(sens_level, FACTORY_TRIGGER_THRESH, 0);
+        hold0_local = (int)preset_threshold(sens_level, FACTORY_MAINTAIN_THRESH, 0);
+    }
 
     s_ld_min_gate = min_gate;
     s_ld_max_gate = max_gate;
-    s_ld_delay_ms = delay_ms;
+    s_ld_delay_s = delay_s;
     s_ld_trigger_sens = trig0_local;
     s_ld_maintain_sens = hold0_local;
     xSemaphoreGive(s_state_mutex);
 
-    ESP_LOGI(TAG, "Applying LD2420 config: min_gate=%d max_gate=%d delay_ms=%d trig0=%d maintain0=%d",
-             min_gate, max_gate, delay_ms, trig0_local, hold0_local);
+    ESP_LOGI(TAG, "Applying LD2420 config: min_gate=%d max_gate=%d delay_s=%d trig0=%d maintain0=%d",
+             min_gate, max_gate, delay_s, trig0_local, hold0_local);
 
     if (!ld2420_lock(s_sensor, pdMS_TO_TICKS(500))) {
         ESP_LOGW(TAG, "Unable to acquire LD2420 bus for config apply");
@@ -411,17 +503,18 @@ static void apply_ld_config(void) {
         ESP_LOGW(TAG, "Failed to set gate range");
         write_ok = false;
     }
-    if (ld2420_set_delay_ms(s_sensor, delay_ms) != ESP_OK) {
+    if (ld2420_set_delay_s(s_sensor, delay_s) != ESP_OK) {
         ESP_LOGW(TAG, "Failed to set delay");
         write_ok = false;
     }
-    if (ld2420_set_trigger_sens(s_sensor, 0, (uint32_t)trig0_local) != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to set trigger sensitivity");
-        write_ok = false;
-    }
-    if (ld2420_set_maintain_sens(s_sensor, 0, (uint32_t)hold0_local) != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to set maintain sensitivity");
-        write_ok = false;
+    if (sens_level >= 0) {
+        for (int g = 0; g < LD2420_GATE_COUNT; ++g) {
+            if (ld2420_set_trigger_sens(s_sensor, g, preset_threshold(sens_level, FACTORY_TRIGGER_THRESH, g)) != ESP_OK ||
+                ld2420_set_maintain_sens(s_sensor, g, preset_threshold(sens_level, FACTORY_MAINTAIN_THRESH, g)) != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to set gate %d thresholds", g);
+                write_ok = false;
+            }
+        }
     }
 
     esp_err_t exit_err = ld2420_exit_command_mode(s_sensor);
@@ -439,17 +532,18 @@ static void apply_ld_config(void) {
         return;
     }
 
-    ESP_LOGI(TAG, "LD2420 reported config: min_gate=%d max_gate=%d delay_ms=%d trig0=%" PRIu32 " maintain0=%" PRIu32,
-             applied.min_gate, applied.max_gate, applied.delay_ms,
+    ESP_LOGI(TAG, "LD2420 reported config: min_gate=%d max_gate=%d delay_s=%d trig0=%" PRIu32 " maintain0=%" PRIu32,
+             applied.min_gate, applied.max_gate, applied.delay_s,
              applied.trigger_sensitivity, applied.maintain_sensitivity);
 
     bool mismatch = (applied.min_gate != min_gate) ||
                     (applied.max_gate != max_gate) ||
-                    (applied.delay_ms != delay_ms) ||
+                    (applied.delay_s != delay_s) ||
                     ((int)applied.trigger_sensitivity != trig0_local) ||
                     ((int)applied.maintain_sensitivity != hold0_local);
 
     update_ld_state_from_snapshot(&applied);
+    sync_ld_sensitivity_from_sensor();
     ha_mqtt_publish_ld2420_config_states();
 
     if (!write_ok) {
@@ -471,6 +565,11 @@ static void apply_ld_config_task(void *arg) {
     }
 }
 
+static void ota_install_result(bool ok, const char *message) {
+    if (!ok) esp_wifi_set_ps(WIFI_PS_MIN_MODEM);  // back to the default power save
+    ha_mqtt_publish_ota_result(ok, message);
+}
+
 static bool start_ota_install(const char *url, const char *sha256_hex,
                               uint32_t size, const char *version) {
     const ota_update_request_t req = {
@@ -479,13 +578,22 @@ static bool start_ota_install(const char *url, const char *sha256_hex,
         .size = size,
         .version = version,
     };
-    esp_err_t err = ota_update_start(&req, ha_mqtt_publish_ota_progress,
-                                     ha_mqtt_publish_ota_result);
+    // Modem sleep throttles the download on this chip; stay awake until done.
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_err_t err = ota_update_start(&req, ha_mqtt_publish_ota_progress, ota_install_result);
     if (err != ESP_OK) {
+        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
         ESP_LOGW(TAG, "OTA start failed: %s", esp_err_to_name(err));
         return false;
     }
     return true;
+}
+
+static void request_apply_ld_config(void);
+
+static void apply_debounce_timer_cb(void *arg) {
+    (void)arg;
+    request_apply_ld_config();
 }
 
 static void request_apply_ld_config(void) {
@@ -518,7 +626,7 @@ static void collect_oled_snapshot(oled_status_snapshot_t *out_snapshot) {
     out_snapshot->distance_cm = s_last_distance;
     out_snapshot->min_gate = s_ld_min_gate;
     out_snapshot->max_gate = s_ld_max_gate;
-    out_snapshot->delay_ms = s_ld_delay_ms;
+    out_snapshot->delay_s = s_ld_delay_s;
     out_snapshot->trigger_sens = s_ld_trigger_sens;
     out_snapshot->maintain_sens = s_ld_maintain_sens;
     snprintf(out_snapshot->fw_version, sizeof(out_snapshot->fw_version), "%s", s_ld_fw_version);
@@ -589,13 +697,12 @@ static void start_mqtt(void) {
         .set_ld_min_gate = set_ld_min_gate,
         .get_ld_max_gate = get_ld_max_gate,
         .set_ld_max_gate = set_ld_max_gate,
-        .get_ld_delay_ms = get_ld_delay_ms,
-        .set_ld_delay_ms = set_ld_delay_ms,
-        .get_ld_trigger_sens = get_ld_trigger_sens,
-        .set_ld_trigger_sens = set_ld_trigger_sens,
-        .get_ld_maintain_sens = get_ld_maintain_sens,
-        .set_ld_maintain_sens = set_ld_maintain_sens,
-        .action_apply_config = request_apply_ld_config,
+        .get_ld_delay_s = get_ld_delay_s,
+        .set_ld_delay_s = set_ld_delay_s,
+        .get_sensitivity = get_sensitivity,
+        .set_sensitivity = set_sensitivity,
+        .load_setting = app_setting_load,
+        .save_setting = app_setting_save,
         .action_ota_install = start_ota_install,
     };
 
@@ -791,6 +898,15 @@ void app_main(void) {
     ld2420_on_state_change(s_sensor, onStateChange);
     ld2420_on_data_update(s_sensor, onDataUpdate);
 
+    const esp_timer_create_args_t debounce_args = {
+        .callback = apply_debounce_timer_cb,
+        .name = "ld_apply_debounce",
+    };
+    if (esp_timer_create(&debounce_args, &s_apply_debounce_timer) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to create LD2420 apply debounce timer");
+        s_apply_debounce_timer = NULL;
+    }
+
     if (xTaskCreate(apply_ld_config_task, "ld_apply_cfg",
                     APPLY_CONFIG_TASK_STACK, NULL,
                     APPLY_CONFIG_TASK_PRIO,
@@ -819,6 +935,11 @@ void app_main(void) {
         esp_err_t wifi_rc = wifi_init();
         if (wifi_rc != ESP_OK) {
             ESP_LOGW(TAG, "wifi_init returned %s; continuing, background retries may proceed", esp_err_to_name(wifi_rc));
+        }
+        // Wall-clock time is only used for the "Last restart" timestamp.
+        esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+        if (esp_netif_sntp_init(&sntp_cfg) != ESP_OK) {
+            ESP_LOGW(TAG, "SNTP init failed; Last restart will stay unknown");
         }
     } else {
         ESP_LOGE(TAG, "No network credentials provisioned - staying offline. Run tools/provision.ps1");
@@ -849,6 +970,15 @@ void app_main(void) {
             xSemaphoreTake(s_state_mutex, portMAX_DELAY);
             presence_snapshot = s_current_presence;
             xSemaphoreGive(s_state_mutex);
+
+            static bool boot_time_published = false;
+            if (!boot_time_published) {
+                time_t now_s = time(NULL);
+                if ((int64_t)now_s > MIN_VALID_EPOCH_S) {
+                    ha_mqtt_publish_boot_time((int64_t)now_s - esp_timer_get_time() / 1000000LL);
+                    boot_time_published = true;
+                }
+            }
 
             if (sensor_data.isValid && ota_update_pending_verify() && ha_mqtt_is_connected()) {
                 ota_update_mark_valid();

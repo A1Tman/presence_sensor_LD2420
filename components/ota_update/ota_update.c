@@ -24,6 +24,8 @@ static const char *TAG = "ota_update";
 #define OTA_READ_CHUNK        4096
 #define OTA_HTTP_TIMEOUT_MS   15000
 #define OTA_PROGRESS_STEP     5
+#define OTA_MAX_RESUMES       3       // reconnect + HTTP Range after a dropped download
+#define OTA_RESUME_DELAY_MS   2000
 
 typedef struct {
     char     url[256];
@@ -130,6 +132,37 @@ static void report_progress(int percent) {
     if (s_on_progress) s_on_progress(percent);
 }
 
+// Open the image URL, from `offset` onwards when resuming. Checks the status
+// (200, or 206 for a range) and that the remaining length is what we expect.
+static bool http_open_at(esp_http_client_handle_t client, uint32_t offset, uint32_t expected,
+                         int64_t *content_len_out, char *msg, size_t msg_size) {
+    if (offset > 0) {
+        char range[40];
+        snprintf(range, sizeof(range), "bytes=%" PRIu32 "-", offset);
+        esp_http_client_set_header(client, "Range", range);
+    } else {
+        esp_http_client_delete_header(client, "Range");
+    }
+
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        snprintf(msg, msg_size, "connect failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    int64_t content_len = esp_http_client_fetch_headers(client);
+    int status = esp_http_client_get_status_code(client);
+    if (status != (offset > 0 ? 206 : 200)) {
+        snprintf(msg, msg_size, "HTTP %d", status);
+        return false;
+    }
+    if (expected && content_len > 0 && (uint64_t)content_len != (uint64_t)(expected - offset)) {
+        snprintf(msg, msg_size, "size mismatch (%" PRId64 ")", content_len);
+        return false;
+    }
+    if (content_len_out) *content_len_out = content_len;
+    return true;
+}
+
 static bool run_ota(char *msg, size_t msg_size) {
     bool ok = false;
     esp_http_client_handle_t client = NULL;
@@ -161,22 +194,11 @@ static bool run_ota(char *msg, size_t msg_size) {
         goto cleanup;
     }
 
-    esp_err_t err = esp_http_client_open(client, 0);
-    if (err != ESP_OK) {
-        snprintf(msg, msg_size, "connect failed: %s", esp_err_to_name(err));
+    int64_t content_len = -1;
+    if (!http_open_at(client, 0, s_job.size, &content_len, msg, msg_size)) {
         goto cleanup;
     }
-
-    int64_t content_len = esp_http_client_fetch_headers(client);
-    int status = esp_http_client_get_status_code(client);
-    if (status != 200) {
-        snprintf(msg, msg_size, "HTTP %d", status);
-        goto cleanup;
-    }
-    if (s_job.size && content_len > 0 && (uint64_t)content_len != s_job.size) {
-        snprintf(msg, msg_size, "size mismatch (%" PRId64 ")", content_len);
-        goto cleanup;
-    }
+    esp_err_t err;
     uint32_t expected = s_job.size ? s_job.size : (content_len > 0 ? (uint32_t)content_len : 0);
 
     buf = malloc(OTA_READ_CHUNK);
@@ -197,12 +219,27 @@ static bool run_ota(char *msg, size_t msg_size) {
 
     uint32_t total = 0;
     int last_pct = 0;
+    int resumes = 0;
     report_progress(0);
     while (true) {
         int n = esp_http_client_read(client, (char *)buf, OTA_READ_CHUNK);
-        if (n < 0) {
-            snprintf(msg, msg_size, "read error");
-            goto cleanup;
+        if (n < 0 || (n == 0 && expected && total < expected)) {
+            // Connection dropped mid-download: reconnect and continue where it
+            // stopped. The SHA-256 and flash writes simply carry on.
+            bool reopened = false;
+            while (!reopened && expected && resumes < OTA_MAX_RESUMES) {
+                resumes++;
+                ESP_LOGW(TAG, "Download interrupted at %" PRIu32 "/%" PRIu32 " bytes; resuming (%d/%d)",
+                         total, expected, resumes, OTA_MAX_RESUMES);
+                vTaskDelay(pdMS_TO_TICKS(OTA_RESUME_DELAY_MS));
+                esp_http_client_close(client);
+                reopened = http_open_at(client, total, expected, NULL, msg, msg_size);
+            }
+            if (!reopened) {
+                if (!msg[0]) snprintf(msg, msg_size, "read error at %" PRIu32 " bytes", total);
+                goto cleanup;
+            }
+            continue;
         }
         if (n == 0) break;
         if ((uint64_t)total + (uint64_t)n > target->size) {
@@ -220,6 +257,9 @@ static bool run_ota(char *msg, size_t msg_size) {
             int pct = (int)(((uint64_t)total * 100U) / expected);
             if (pct > 99) pct = 99;  // 100 is reported only after validation
             if (pct >= last_pct + OTA_PROGRESS_STEP) {
+                if (pct / 10 != last_pct / 10) {
+                    ESP_LOGI(TAG, "Downloaded %d%% (%" PRIu32 " bytes)", pct, total);
+                }
                 last_pct = pct;
                 report_progress(pct);
             }

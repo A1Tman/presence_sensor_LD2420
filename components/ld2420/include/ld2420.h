@@ -71,10 +71,12 @@ struct ld2420_t {
     bool config_mode;
 };
 
+#define LD2420_GATE_COUNT 16      // gates 0..15, each ~70 cm deep
+
 typedef struct {
     int min_gate;
     int max_gate;
-    int delay_ms;
+    int delay_s;
     uint32_t trigger_sensitivity;
     uint32_t maintain_sensitivity;
 } ld2420_config_snapshot_t;
@@ -111,9 +113,12 @@ esp_err_t ld2420_set_param(ld2420_t* sensor, uint16_t param_id, uint32_t value);
 
 // Convenience setters (high-level)
 esp_err_t ld2420_set_gate_range(ld2420_t* sensor, int min_gate, int max_gate);
-esp_err_t ld2420_set_delay_ms(ld2420_t* sensor, int delay_ms);
+esp_err_t ld2420_set_delay_s(ld2420_t* sensor, int delay_s);
 esp_err_t ld2420_set_trigger_sens(ld2420_t* sensor, int index, uint32_t value);   // index 0..15 maps to 0x0010+index
 esp_err_t ld2420_set_maintain_sens(ld2420_t* sensor, int index, uint32_t value);  // index 0..15 maps to 0x0020+index
 esp_err_t ld2420_read_config(ld2420_t* sensor, ld2420_config_snapshot_t *out_config);
+// Read the move (trigger) and still (maintain) energy thresholds of all 16 gates.
+esp_err_t ld2420_read_thresholds(ld2420_t* sensor, uint32_t trigger[LD2420_GATE_COUNT],
+                                 uint32_t maintain[LD2420_GATE_COUNT]);
 
 #endif // LD2420_H

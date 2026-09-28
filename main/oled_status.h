@@ -19,7 +19,7 @@ typedef struct {
     uint8_t ip_last_octet;
     int min_gate;
     int max_gate;
-    int delay_ms;
+    int delay_s;
     int trigger_sens;
     int maintain_sens;
     char fw_version[16];
